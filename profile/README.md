@@ -24,3 +24,5 @@ To provide some advanced functionality, there are some (optional) backends.
 The system is deployed via docker-compose.
 
 The repositories in this GitHub organisation reflect these different components.
+
+Start here with the core frontend: **[ndb-core](https://github.com/Aam-Digital/ndb-core)**
