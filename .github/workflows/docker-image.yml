@@ -456,7 +456,9 @@ jobs:
                 'NR == FNR { if ($1 == image && $3 != new) moved[$3] = moved[$3] "," $2 ","; next }
                 ($2 in moved) { n = split($3, t, ","); for (i = 1; i <= n; i++) if (index(moved[$2], "," t[i] ",")) { print $2; exit } }' \
                 "$record" "$work/versions")
-              [ -n "$stale" ] && [ "$attempt" -lt 3 ] || break
+              if [ -z "$stale" ] || [ "$attempt" -ge 3 ]; then
+                break
+              fi
               echo "$image: the package listing does not show the new tags yet, retrying in 10 seconds"
               sleep 10
             done
@@ -470,7 +472,9 @@ jobs:
             safe=true
             if [ -n "$oldest" ]; then
               while IFS=$'\t' read -r id digest tags; do
-                [ -n "$tags" ] && [ "$id" -ge "$oldest" ] || continue
+                if [ -z "$tags" ] || [ "$id" -lt "$oldest" ]; then
+                  continue
+                fi
                 echo "$digest" >> "$work/referenced"
                 if grep -qxF "$digest" "$work/candidates"; then
                   awk -v d="$digest" '$1 == d { print $2 }' "$work/children" >> "$work/referenced"
