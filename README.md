@@ -37,7 +37,8 @@ A repository keeps only what is specific to it in its own `renovate.json` and ex
 ### How repo settings combine with the presets
 
 - **`packageRules`** are concatenated: the presets' rules come first, then the repo's own. For each option, the last matching rule wins, so a repo rule overrides a preset rule.
-- **Top-level options** such as `labels`, `reviewers`, `schedule`, `timezone`, `rangeStrategy` and `enabledManagers` are replaced as a whole by the repo's value (arrays are not merged).
+- **Most top-level options**, such as `labels`, `reviewers`, `schedule`, `timezone`, `rangeStrategy` and `enabledManagers`, are replaced as a whole by the repo's value (arrays are not merged).
+- A few list options are **concatenated** instead: `packageRules`, `customManagers`, `ignoreDeps`, `addLabels` and `additionalReviewers`.
 - **Object options** such as `vulnerabilityAlerts`, `lockFileMaintenance` and `constraints` are merged key by key: the repo only needs to set the keys it changes. Setting `vulnerabilityAlerts.labels` therefore replaces only those labels.
 - To add reviewers without repeating the preset's, use `additionalReviewers` (it is added to `reviewers`).
 - **`labels` in a package rule beat the top-level `labels`.** To put an extra label on some PRs, use `addLabels` in the rule. It adds to whatever labels apply instead of replacing them. For the same reason, the presets set no `labels` inside package rules.
