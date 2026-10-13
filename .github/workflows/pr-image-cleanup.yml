@@ -1,0 +1,89 @@
+# Deletes the `pr-<number>` image(s) of a pull request from ghcr.io when the PR is closed.
+#
+# Uses dataaxiom/ghcr-cleanup-action, which is manifest-aware:
+# - deleting a multi-platform image index also deletes its per-platform and attestation manifests,
+#   unless another image still references them;
+# - a version that carries another tag besides the deleted one is only untagged, never deleted;
+# - it reads all package versions (paginated), not only the first page.
+name: PR image cleanup
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          ghcr.io package name(s) owned by the repository owner, comma-separated
+          (e.g. `aam-services,keycloak-third-party-authentication`). Defaults to the repository name.
+      tags:
+        type: string
+        required: false
+        default: ""
+        description: Tag(s) to delete, comma-separated. Defaults to `pr-<number>` of the pull request that triggered the workflow.
+      dry-run:
+        type: boolean
+        required: false
+        default: false
+        description: Only log what would be deleted
+    secrets:
+      token:
+        required: false
+        description: >-
+          Token for the GitHub Packages API (classic PAT with `read:packages` and `delete:packages`).
+          Only needed if the repository does not have the Admin role in the package's "Manage Actions access" settings.
+          Defaults to the workflow's GITHUB_TOKEN.
+
+jobs:
+  # The job id is part of the check name (`<caller job> / cleanup`). Do not rename it within v1.
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write # delete package versions
+    # ghcr-cleanup-action is not safe to run in parallel against the same package
+    concurrency:
+      group: ghcr-cleanup-${{ github.repository }}-${{ inputs.packages || github.event.repository.name }}
+      cancel-in-progress: false
+    steps:
+      - name: Determine packages and tags
+        id: config
+        env:
+          PACKAGES: ${{ inputs.packages || github.event.repository.name }}
+          TAGS: ${{ inputs.tags }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          TAGS="${TAGS//[[:space:]]/}"
+          PACKAGES="${PACKAGES//[[:space:]]/}"
+          if [ -z "$TAGS" ]; then
+            if [ -z "$PR_NUMBER" ]; then
+              echo "::error::No 'tags' given and not triggered by a pull_request event"
+              exit 1
+            fi
+            TAGS="pr-$PR_NUMBER"
+          fi
+          # Without a tag, ghcr-cleanup-action falls back to deleting all untagged versions.
+          # Guard against that and against wildcards: this workflow deletes exact tags only.
+          if ! [[ "$TAGS" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*(,[A-Za-z0-9_][A-Za-z0-9_.-]*)*$ ]]; then
+            echo "::error::Invalid tag list '$TAGS'"
+            exit 1
+          fi
+          if ! [[ "$PACKAGES" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
+            echo "::error::Invalid package list '$PACKAGES'"
+            exit 1
+          fi
+          echo "Deleting tag(s) $TAGS from package(s) $PACKAGES"
+          {
+            echo "tags=$TAGS"
+            echo "packages=$PACKAGES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete images
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.token || github.token }}
+          owner: ${{ github.repository_owner }}
+          packages: ${{ steps.config.outputs.packages }}
+          delete-tags: ${{ steps.config.outputs.tags }}
+          delete-untagged: false
+          dry-run: ${{ inputs.dry-run }}

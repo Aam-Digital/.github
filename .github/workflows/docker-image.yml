@@ -1,0 +1,265 @@
+# Builds a container image and (by default) pushes it, for PR, prerelease and release builds alike.
+# Callers only pass inputs; see README.md in this folder for examples and the resulting check name.
+#
+# Tags are always explicit (docker/metadata-action's automatic `latest` is turned off):
+# - `version`      -> tag `<version>` (+ the `org.opencontainers.image.version` label)
+# - `stable: true` -> tags `stable` and `latest` (derive it from `!github.event.release.prerelease`,
+#                     never by parsing the version string)
+# - `tags`         -> any extra tags, e.g. `edge`, `master` or `pr-123`
+# A PR image must carry nothing but its `pr-<n>` tag, otherwise pr-image-cleanup.yml leaves it in place.
+name: Docker image
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        type: string
+        required: true
+        description: Image name(s) without tag, one per line (or comma-separated), e.g. `ghcr.io/aam-digital/replication-backend`. All of them get the same tags.
+      context:
+        type: string
+        required: false
+        default: .
+        description: Docker build context
+      file:
+        type: string
+        required: false
+        default: ""
+        description: Path to the Dockerfile (default `<context>/Dockerfile`)
+      version:
+        type: string
+        required: false
+        default: ""
+        description: Version to tag the image with; also set as the `org.opencontainers.image.version` label. Leave empty for PR builds.
+      stable:
+        type: boolean
+        required: false
+        default: false
+        description: Also tag the image `stable` and `latest` (full releases only; requires `version`)
+      tags:
+        type: string
+        required: false
+        default: ""
+        description: Extra tags, one per line (or comma-separated), e.g. `edge` or `pr-123`
+      labels:
+        type: string
+        required: false
+        default: ""
+        description: Extra/overriding OCI labels (`key=value`, one per line), e.g. a custom `org.opencontainers.image.description`
+      platforms:
+        type: string
+        required: false
+        default: linux/amd64,linux/arm64
+        description: Target platforms. PR builds pass `linux/amd64`. QEMU is only set up if a non-amd64 platform is requested.
+      build-args:
+        type: string
+        required: false
+        default: ""
+        description: Build arguments (`KEY=value`, one per line)
+      push:
+        type: boolean
+        required: false
+        default: true
+        description: Push the image. Set to false (e.g. for PRs from forks) to only check that it builds.
+      cache-scope:
+        type: string
+        required: false
+        default: ""
+        description: GitHub Actions cache scope. Defaults to the last path segment of the first image, so that the images of a multi-image repository do not overwrite each other's cache.
+      artifact-name:
+        type: string
+        required: false
+        default: ""
+        description: Name of a workflow artifact (e.g. built web app files from an earlier job) to download before building
+      artifact-path:
+        type: string
+        required: false
+        default: .
+        description: Where to download `artifact-name` to
+      prepare:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          Shell commands run in the checked-out repository before building, e.g. to inject the version
+          into package.json. `$VERSION` holds the `version` input.
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+        description: Docker Hub username; only needed if one of the images is pushed to Docker Hub
+      DOCKERHUB_TOKEN:
+        required: false
+        description: Docker Hub access token (or password) for DOCKERHUB_USERNAME
+    outputs:
+      digest:
+        description: Digest of the built image (the multi-platform index if more than one platform was built)
+        value: ${{ jobs.build.outputs.digest }}
+      tags:
+        description: All image references that were tagged (`<image>:<tag>`, one per line)
+        value: ${{ jobs.build.outputs.tags }}
+
+jobs:
+  # The job id is part of the check name (`<caller job> / build`). Do not rename it within v1.
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download artifact ${{ inputs.artifact-name }}
+        if: inputs.artifact-name != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-path }}
+
+      - name: Prepare build
+        if: inputs.prepare != ''
+        env:
+          PREPARE: ${{ inputs.prepare }}
+          VERSION: ${{ inputs.version }}
+        run: eval "$PREPARE"
+
+      - name: Compute tags and settings
+        id: config
+        env:
+          IMAGES: ${{ inputs.images }}
+          VERSION: ${{ inputs.version }}
+          STABLE: ${{ inputs.stable }}
+          EXTRA_TAGS: ${{ inputs.tags }}
+          LABELS: ${{ inputs.labels }}
+          PLATFORMS: ${{ inputs.platforms }}
+          CACHE_SCOPE: ${{ inputs.cache-scope }}
+        run: |
+          # Splits a list separated by newlines, commas or spaces into words.
+          words() { printf '%s\n' "$1" | tr ',' '\n' | tr -s '[:space:]' '\n' | sed '/^$/d'; }
+
+          mapfile -t images < <(words "$IMAGES")
+          if [ "${#images[@]}" -eq 0 ]; then
+            echo "::error::No image name given (input 'images')"
+            exit 1
+          fi
+
+          tags=()
+          [ -z "$VERSION" ] || tags+=("$VERSION")
+          mapfile -t -O "${#tags[@]}" tags < <(words "$EXTRA_TAGS")
+          if [ "$STABLE" = "true" ]; then
+            if [ -z "$VERSION" ]; then
+              echo "::error::'stable: true' requires a 'version'"
+              exit 1
+            fi
+            tags+=(stable latest)
+          fi
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "::error::No tag to apply: set 'version' and/or 'tags'"
+            exit 1
+          fi
+          for tag in "${tags[@]}"; do
+            if ! [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::Invalid image tag '$tag'"
+              exit 1
+            fi
+          done
+
+          labels="$LABELS"
+          if [ -n "$VERSION" ] && ! grep -q '^[[:space:]]*org\.opencontainers\.image\.version=' <<< "$LABELS"; then
+            labels="org.opencontainers.image.version=$VERSION"$'\n'"$LABELS"
+          fi
+
+          needs_qemu=false
+          while IFS= read -r platform; do
+            [ "$platform" = "linux/amd64" ] || needs_qemu=true
+          done < <(words "$PLATFORMS")
+
+          needs_ghcr_login=false
+          needs_dockerhub_login=false
+          for image in "${images[@]}"; do
+            host="${image%%/*}"
+            case "$host" in
+              ghcr.io) needs_ghcr_login=true ;;
+              docker.io | index.docker.io) needs_dockerhub_login=true ;;
+              *.* | *:* | localhost) ;; # another registry: not supported for login
+              *) needs_dockerhub_login=true ;; # no registry host means Docker Hub
+            esac
+          done
+
+          scope="$CACHE_SCOPE"
+          if [ -z "$scope" ]; then
+            scope="${images[0]##*/}"
+          fi
+
+          delimiter="EOF_$(openssl rand -hex 8)"
+          {
+            echo "images<<$delimiter"
+            printf '%s\n' "${images[@]}"
+            echo "$delimiter"
+            echo "tags<<$delimiter"
+            printf 'type=raw,value=%s\n' "${tags[@]}"
+            echo "$delimiter"
+            echo "labels<<$delimiter"
+            printf '%s\n' "$labels"
+            echo "$delimiter"
+            echo "needs-qemu=$needs_qemu"
+            echo "needs-ghcr-login=$needs_ghcr_login"
+            echo "needs-dockerhub-login=$needs_dockerhub_login"
+            echo "cache-scope=$scope"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Images: ${images[*]}"
+          echo "Tags: ${tags[*]}"
+          echo "Platforms: $PLATFORMS (QEMU: $needs_qemu)"
+          echo "Cache scope: $scope"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.config.outputs.images }}
+          tags: ${{ steps.config.outputs.tags }}
+          labels: ${{ steps.config.outputs.labels }}
+          flavor: |
+            latest=false
+
+      - name: Set up QEMU
+        if: steps.config.outputs.needs-qemu == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        if: inputs.push && steps.config.outputs.needs-ghcr-login == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: inputs.push && steps.config.outputs.needs-dockerhub-login == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build-args }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}
+          cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }},ignore-error=true

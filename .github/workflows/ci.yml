@@ -1,0 +1,16 @@
+# CI of this repository: lints the shared workflows themselves.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  # Check name: `actionlint / actionlint`
+  actionlint:
+    uses: ./.github/workflows/actionlint.yml
