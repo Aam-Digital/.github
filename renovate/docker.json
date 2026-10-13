@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Add-on for repos that build Docker images (use together with renovate/default): base image updates in their own weekly PR.",
+  "packageRules": [
+    {
+      "description": "Minor and patch updates of Docker base images. The node image is left to the node group of renovate/node, whatever the order of the extends.",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "matchDepNames": ["!node"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "docker-base-image"
+    }
+  ]
+}
