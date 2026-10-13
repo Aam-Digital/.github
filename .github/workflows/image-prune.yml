@@ -1,0 +1,99 @@
+# Deletes old prerelease images (e.g. `1.4.0-edge.3`) from ghcr.io, typically after a full release.
+#
+# Uses dataaxiom/ghcr-cleanup-action (like pr-image-cleanup.yml), which is manifest-aware: deleting a multi-platform
+# image index also deletes its per-platform and attestation manifests, unless another image still references them.
+# - A version that carries one of the `exclude-tags` (e.g. the image `edge` points to now) is skipped entirely:
+#   it is neither deleted nor untagged.
+# - A version with several matching tags and no excluded one is only untagged by the action, not deleted.
+# - Untagged versions are never touched (`delete-untagged: false`).
+name: Image prune
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        type: string
+        required: false
+        default: ""
+        description: ghcr.io package name(s) owned by the repository owner, comma-separated. Defaults to the repository name.
+      tag-patterns:
+        type: string
+        required: false
+        default: "*-edge.*,*-master.*"
+        description: Tags to delete, comma-separated; `*` matches any characters (e.g. `*-edge.*`)
+      exclude-tags:
+        type: string
+        required: false
+        default: edge,master,stable,latest
+        description: Comma-separated tags (wildcards allowed) whose images are never deleted or untagged
+      dry-run:
+        type: boolean
+        required: false
+        default: false
+        description: Only log what would be deleted
+    secrets:
+      token:
+        required: false
+        description: >-
+          Token for the GitHub Packages API (classic PAT with `read:packages` and `delete:packages`).
+          Defaults to the workflow's GITHUB_TOKEN, which can delete versions of packages that are linked to the
+          repository (with the Admin role in the package's "Manage Actions access" settings).
+
+jobs:
+  # The job id is part of the check name (`<caller job> / prune`). Do not rename it within v1.
+  prune:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write # delete package versions
+    concurrency:
+      group: ghcr-prune-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check inputs
+        id: config
+        env:
+          PACKAGES: ${{ inputs.packages || github.event.repository.name }}
+          TAG_PATTERNS: ${{ inputs.tag-patterns }}
+          EXCLUDE_TAGS: ${{ inputs.exclude-tags }}
+        run: |
+          PACKAGES="${PACKAGES//[[:space:]]/}"
+          TAG_PATTERNS="${TAG_PATTERNS//[[:space:]]/}"
+          EXCLUDE_TAGS="${EXCLUDE_TAGS//[[:space:]]/}"
+          if ! [[ "$PACKAGES" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
+            echo "::error::Invalid package list '$PACKAGES'"
+            exit 1
+          fi
+          # Without tags, ghcr-cleanup-action would fall back to deleting all untagged versions.
+          if ! [[ "$TAG_PATTERNS" =~ ^[A-Za-z0-9_.*-]+(,[A-Za-z0-9_.*-]+)*$ ]]; then
+            echo "::error::Invalid tag pattern list '$TAG_PATTERNS'"
+            exit 1
+          fi
+          # Every pattern must name something (a bare `*` would delete every image without an excluded tag).
+          IFS=',' read -r -a patterns <<< "$TAG_PATTERNS"
+          for pattern in "${patterns[@]}"; do
+            if ! [[ "$pattern" =~ [A-Za-z0-9] ]]; then
+              echo "::error::Tag pattern '$pattern' is too broad"
+              exit 1
+            fi
+          done
+          if [ -n "$EXCLUDE_TAGS" ] && ! [[ "$EXCLUDE_TAGS" =~ ^[A-Za-z0-9_.*-]+(,[A-Za-z0-9_.*-]+)*$ ]]; then
+            echo "::error::Invalid exclude-tags list '$EXCLUDE_TAGS'"
+            exit 1
+          fi
+          echo "Deleting tags $TAG_PATTERNS (except images tagged $EXCLUDE_TAGS) from package(s) $PACKAGES"
+          {
+            echo "packages=$PACKAGES"
+            echo "tag-patterns=$TAG_PATTERNS"
+            echo "exclude-tags=$EXCLUDE_TAGS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete prerelease images
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.token || github.token }}
+          owner: ${{ github.repository_owner }}
+          packages: ${{ steps.config.outputs.packages }}
+          delete-tags: ${{ steps.config.outputs.tag-patterns }}
+          exclude-tags: ${{ steps.config.outputs.exclude-tags }}
+          delete-untagged: false
+          dry-run: ${{ inputs.dry-run }}

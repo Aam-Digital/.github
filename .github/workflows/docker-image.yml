@@ -490,10 +490,6 @@ jobs:
             delete_version() {
               local line id tags
               if grep -qxF "$1" "$work/deleted"; then return 0; fi
-              if grep -qxF "$1" "$work/referenced"; then
-                echo "  kept $2 $1: still used by a tagged image"
-                return 1
-              fi
               line=$(awk -F'\t' -v d="$1" '$2 == d { print $1 "\t" $3; exit }' "$work/versions")
               if [ -z "$line" ]; then
                 echo "  kept $2 $1: not found among the newest package versions"
@@ -502,6 +498,10 @@ jobs:
               IFS=$'\t' read -r id tags <<< "$line"
               if [ -n "$tags" ]; then
                 echo "  kept $2 $1: still tagged $tags"
+                return 1
+              fi
+              if grep -qxF "$1" "$work/referenced"; then
+                echo "  kept $2 $1: still used by a tagged image"
                 return 1
               fi
               if gh api --silent --method DELETE "$api/versions/$id"; then
