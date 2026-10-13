@@ -190,8 +190,10 @@ Required permissions of the calling job: `pull-requests: read`.
 ```yaml
 # .github/workflows/pr-title-lint.yml
 on:
-  # pull_request_target so that it also runs for PRs from forks; it never checks out PR code
-  pull_request_target:
+  # pull_request_target so that it also runs for PRs from forks. Safe here: the workflow never checks out PR code
+  # and only reads the PR title from the event payload. The zizmor comment keeps `qlty check` (dangerous-triggers,
+  # blocking with qlty's cloud defaults) from failing on this line.
+  pull_request_target: # zizmor: ignore[dangerous-triggers] never checks out PR code, only reads the PR title from the event payload
     types: [opened, edited, synchronize, reopened]
 
 jobs:
