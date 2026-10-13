@@ -3,6 +3,22 @@
 Shared configuration for the repositories of the Aam-Digital organisation.
 (The organisation profile shown on GitHub lives in [`profile/README.md`](profile/README.md).)
 
+| Folder / file | What |
+| --- | --- |
+| [`.github/workflows/`](.github/workflows) | Reusable GitHub Actions workflows (container images, releases, image cleanup, PR title and workflow linting). See its [README](.github/workflows/README.md) for inputs, permissions, check names, the release model and how the `v1` tag is moved. |
+| [`renovate/`](renovate) | Shared Renovate presets (below) |
+| [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE), [`SECURITY.md`](SECURITY.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Organisation-wide defaults (below) |
+
+## Default community health files
+
+GitHub uses the issue templates, `SECURITY.md` and `CONTRIBUTING.md` of this repository for every repository of the
+organisation that has no file of its own (public and private ones). A repository with its own
+`.github/ISSUE_TEMPLATE/` folder (e.g. ndb-core) uses only its own templates.
+
+- The issue templates (Bug report, Feature request, Technical task) set the organisation's **issue types**
+  (`Bug`, `New Feature`, `Task`) instead of labels, because labels differ between repositories.
+- There is deliberately no default pull request template: PR templates are repository-specific.
+
 ## Renovate presets
 
 The [`renovate/`](renovate) folder holds shared [Renovate](https://docs.renovatebot.com/) presets.
