@@ -137,15 +137,25 @@ Deletes the image(s) tagged `pr-<n>` when the PR is closed, using
 attestation manifests, unless another image still uses them; a version that also carries another tag is only untagged.
 Untagged versions that are not children of the deleted image are never touched.
 
-Required permissions of the calling job: `packages: write`.
-With the default `GITHUB_TOKEN`, the repository also needs the **Admin** role in the package's settings under
-"Manage Actions access". Otherwise pass a classic PAT (`read:packages`, `delete:packages`) as the `token` secret.
+Most leaked PR images are not failed deletes but a race: the build of the PR's last push is still running when
+the PR is merged, and pushes `pr-<n>` only after the cleanup ran. Pass the PR build workflow file(s) as
+`build-workflows`: their unfinished runs on the PR's head branch are then cancelled, and the cleanup waits (up to
+15 minutes) until they have stopped before deleting.
 
-| Input      | Default              | Description |
-| ---------- | -------------------- | ----------- |
-| `packages` | repository name      | ghcr.io package name(s), comma-separated |
-| `tags`     | `pr-<number>` of the triggering PR | Exact tag(s), comma-separated (no wildcards) |
-| `dry-run`  | `false`              | Only log what would be deleted |
+Required permissions of the calling job: `actions: write` (cancel PR builds), `packages: write`.
+The default `GITHUB_TOKEN` can delete versions of packages linked to the repository (Admin role in the package's
+"Manage Actions access" settings). Otherwise pass a classic PAT
+(`read:packages`, `delete:packages`) as the `token` secret.
+
+| Input             | Default                            | Description |
+| ----------------- | ---------------------------------- | ----------- |
+| `packages`        | repository name                    | ghcr.io package name(s), comma-separated |
+| `tags`            | `pr-<number>` of the triggering PR | Exact tag(s), comma-separated (no wildcards) |
+| `build-workflows` | –                                  | PR build workflow file name(s), comma-separated, to cancel and wait for first |
+| `dry-run`         | `false`                            | Only log what would be deleted |
+
+Note: this deletes the image that is tagged `pr-<n>` when the PR closes. Images of earlier pushes to the PR lost the tag
+when they were replaced and are untagged by then; they are not touched here.
 
 ```yaml
 # .github/workflows/pr-closed.yml
@@ -159,11 +169,13 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     uses: Aam-Digital/.github/.github/workflows/pr-image-cleanup.yml@v1
     permissions:
+      actions: write
       packages: write
-    # secrets:
-    #   token: ${{ secrets.GH_TOKEN }} # only if the repository lacks the package's Admin role
-    # with:
+    with:
+      build-workflows: pr-release.yml
     #   packages: aam-services,keycloak-third-party-authentication
+    # secrets:
+    #   token: ${{ secrets.GH_TOKEN }} # only if the repository is not linked to the package
 ```
 
 ## `pr-title-lint.yml`

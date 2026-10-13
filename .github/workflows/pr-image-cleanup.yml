@@ -5,6 +5,10 @@
 #   unless another image still references them;
 # - a version that carries another tag besides the deleted one is only untagged, never deleted;
 # - it reads all package versions (paginated), not only the first page.
+#
+# Most leaked PR images are a race, not a failed delete: the build of the PR's last push is still running when
+# the PR is merged, so it pushes `pr-<n>` after the cleanup ran. With `build-workflows`, unfinished runs of the PR
+# build workflow(s) on the PR's head branch are cancelled, and the cleanup waits until they have stopped.
 name: PR image cleanup
 
 on:
@@ -22,6 +26,14 @@ on:
         required: false
         default: ""
         description: Tag(s) to delete, comma-separated. Defaults to `pr-<number>` of the pull request that triggered the workflow.
+      build-workflows:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          Workflow file name(s) of the PR image build, comma-separated (e.g. `pr-release.yml`). Their unfinished runs
+          on the PR's head branch are cancelled, and awaited, before deleting, so that they cannot push the image again
+          afterwards. Requires `actions: write`.
       dry-run:
         type: boolean
         required: false
@@ -32,14 +44,15 @@ on:
         required: false
         description: >-
           Token for the GitHub Packages API (classic PAT with `read:packages` and `delete:packages`).
-          Only needed if the repository does not have the Admin role in the package's "Manage Actions access" settings.
-          Defaults to the workflow's GITHUB_TOKEN.
+          Defaults to the workflow's GITHUB_TOKEN, which can delete versions of packages that are linked to the
+          repository (with the Admin role in the package's "Manage Actions access" settings).
 
 jobs:
   # The job id is part of the check name (`<caller job> / cleanup`). Do not rename it within v1.
   cleanup:
     runs-on: ubuntu-latest
     permissions:
+      actions: write # cancel unfinished PR builds (build-workflows)
       packages: write # delete package versions
     # ghcr-cleanup-action is not safe to run in parallel against the same package
     concurrency:
@@ -78,7 +91,46 @@ jobs:
             echo "packages=$PACKAGES"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Cancel and wait for unfinished PR builds
+        if: inputs.build-workflows != '' && github.event.pull_request.head.repo.full_name == github.repository
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_WORKFLOWS: ${{ inputs.build-workflows }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          OWN_RUN_ID: ${{ github.run_id }}
+        run: |
+          IFS=',' read -r -a workflows <<< "${BUILD_WORKFLOWS//[[:space:]]/}"
+          run_ids=()
+          for workflow in "${workflows[@]}"; do
+            [ -n "$workflow" ] || continue
+            if ! [[ "$workflow" =~ ^[A-Za-z0-9_.-]+\.ya?ml$ ]]; then
+              echo "::error::Invalid workflow file name '$workflow'"
+              exit 1
+            fi
+            mapfile -t -O "${#run_ids[@]}" run_ids < <(gh run list -R "$GITHUB_REPOSITORY" --workflow "$workflow" \
+              --branch "$HEAD_REF" --limit 50 --json databaseId,status \
+              --jq ".[] | select(.status != \"completed\" and .databaseId != $OWN_RUN_ID) | .databaseId")
+          done
+          if [ "${#run_ids[@]}" -eq 0 ]; then
+            echo "No unfinished PR build runs"
+            exit 0
+          fi
+          for id in "${run_ids[@]}"; do
+            echo "Cancelling PR build run $id"
+            gh run cancel "$id" -R "$GITHUB_REPOSITORY" || true # it may have finished in the meantime
+          done
+          for id in "${run_ids[@]}"; do
+            until [ "$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json status --jq .status)" = "completed" ]; do
+              echo "Waiting for run $id to stop ..."
+              sleep 10
+            done
+          done
+
       - name: Delete images
+        # also after a timeout of the step above (deleting what is there is better than nothing),
+        # but never without validated packages and tags
+        if: ${{ !cancelled() && steps.config.outcome == 'success' }}
         uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
         with:
           token: ${{ secrets.token || github.token }}
