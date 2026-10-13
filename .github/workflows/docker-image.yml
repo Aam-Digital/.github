@@ -1,5 +1,5 @@
 # Builds a container image and (by default) pushes it, for PR, prerelease and release builds alike.
-# Callers only pass inputs; see README.md in this folder for examples and the resulting check name.
+# Callers only pass inputs; see README.md in this folder for examples and the resulting check names.
 #
 # Tags are always explicit (docker/metadata-action's automatic `latest` is turned off):
 # - `version`      -> tag `<version>` (+ the `org.opencontainers.image.version` label)
@@ -7,6 +7,16 @@
 #                     never by parsing the version string)
 # - `tags`         -> any extra tags, e.g. `edge`, `master` or `pr-123`
 # A PR image must carry nothing but its `pr-<n>` tag, otherwise pr-image-cleanup.yml leaves it in place.
+#
+# Two modes:
+# - default: one job `build` builds all platforms (QEMU for non-amd64 platforms);
+# - `native-runners: true`: one job `build-native (<platform>)` per platform on a native runner pushes by digest,
+#   then the job `merge` creates the multi-platform image with all tags.
+#
+# `cleanup-replaced` (default on) deletes the ghcr.io image a tag pointed to before this push, if no tag is left on it
+# (e.g. the previous image of a PR), including its platform and attestation manifests that no tagged image still uses.
+#
+# Steps that are identical in several jobs are written once and reused with YAML anchors (`&name` / `*name`).
 name: Docker image
 
 on:
@@ -50,7 +60,25 @@ on:
         type: string
         required: false
         default: linux/amd64,linux/arm64
-        description: Target platforms. PR builds pass `linux/amd64`. QEMU is only set up if a non-amd64 platform is requested.
+        description: >-
+          Target platforms. PR builds pass `linux/amd64`. QEMU is only set up if a non-amd64 platform is requested.
+          With `native-runners`, only `linux/amd64` and `linux/arm64` are supported.
+      native-runners:
+        type: boolean
+        required: false
+        default: false
+        description: >-
+          Build each platform on a native runner (`linux/amd64` on `ubuntu-latest`, `linux/arm64` on
+          `ubuntu-24.04-arm`) instead of emulating with QEMU, then merge them into one multi-platform image.
+          Check names change to `<caller job> / build-native (<platform>)` and `<caller job> / merge`.
+      cleanup-replaced:
+        type: boolean
+        required: false
+        default: true
+        description: >-
+          After pushing, delete the ghcr.io image that one of the tags pointed to before, if it has no tag left
+          (e.g. the previous image of a PR), together with its platform and attestation manifests that no tagged
+          image still uses. A failure here only logs a warning.
       build-args:
         type: string
         required: false
@@ -65,7 +93,10 @@ on:
         type: string
         required: false
         default: ""
-        description: GitHub Actions cache scope. Defaults to the last path segment of the first image, so that the images of a multi-image repository do not overwrite each other's cache.
+        description: >-
+          GitHub Actions cache scope. Defaults to the last path segment of the first image, so that the images of a
+          multi-image repository do not overwrite each other's cache. Must differ between calls in the same workflow run
+          with `native-runners` (it also names the digest artifacts).
       artifact-name:
         type: string
         required: false
@@ -93,42 +124,47 @@ on:
     outputs:
       digest:
         description: Digest of the built image (the multi-platform index if more than one platform was built)
-        value: ${{ jobs.build.outputs.digest }}
+        value: ${{ jobs.build.outputs.digest || jobs.merge.outputs.digest }}
       tags:
         description: All image references that were tagged (`<image>:<tag>`, one per line)
-        value: ${{ jobs.build.outputs.tags }}
+        value: ${{ jobs.build.outputs.tags || jobs.merge.outputs.tags }}
 
 jobs:
   # The job id is part of the check name (`<caller job> / build`). Do not rename it within v1.
   build:
+    if: ${{ !inputs.native-runners }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # push to ghcr.io
+      packages: write # push to ghcr.io, delete replaced images
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - name: Checkout repository
+      - &checkout
+        name: Checkout repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - name: Download artifact ${{ inputs.artifact-name }}
+      - &download-artifact
+        name: Download artifact ${{ inputs.artifact-name }}
         if: inputs.artifact-name != ''
         uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.artifact-path }}
 
-      - name: Prepare build
+      - &prepare
+        name: Prepare build
         if: inputs.prepare != ''
         env:
           PREPARE: ${{ inputs.prepare }}
           VERSION: ${{ inputs.version }}
         run: eval "$PREPARE"
 
-      - name: Compute tags and settings
+      - &config
+        name: Compute tags and settings
         id: config
         env:
           IMAGES: ${{ inputs.images }}
@@ -137,6 +173,7 @@ jobs:
           EXTRA_TAGS: ${{ inputs.tags }}
           LABELS: ${{ inputs.labels }}
           PLATFORMS: ${{ inputs.platforms }}
+          NATIVE_RUNNERS: ${{ inputs.native-runners }}
           CACHE_SCOPE: ${{ inputs.cache-scope }}
         run: |
           # Splits a list separated by newlines, commas or spaces into words.
@@ -177,7 +214,12 @@ jobs:
           needs_qemu=false
           while IFS= read -r platform; do
             [ "$platform" = "linux/amd64" ] || needs_qemu=true
+            if [ "$NATIVE_RUNNERS" = "true" ] && [ "$platform" != "linux/amd64" ] && [ "$platform" != "linux/arm64" ]; then
+              echo "::error::'native-runners' supports only the platforms linux/amd64 and linux/arm64, not '$platform'"
+              exit 1
+            fi
           done < <(words "$PLATFORMS")
+          [ "$NATIVE_RUNNERS" != "true" ] || needs_qemu=false
 
           needs_ghcr_login=false
           needs_dockerhub_login=false
@@ -201,8 +243,12 @@ jobs:
             echo "images<<$delimiter"
             printf '%s\n' "${images[@]}"
             echo "$delimiter"
+            echo "image-names=$(IFS=,; echo "${images[*]}")"
             echo "tags<<$delimiter"
             printf 'type=raw,value=%s\n' "${tags[@]}"
+            echo "$delimiter"
+            echo "tag-list<<$delimiter"
+            printf '%s\n' "${tags[@]}"
             echo "$delimiter"
             echo "labels<<$delimiter"
             printf '%s\n' "$labels"
@@ -215,10 +261,11 @@ jobs:
 
           echo "Images: ${images[*]}"
           echo "Tags: ${tags[*]}"
-          echo "Platforms: $PLATFORMS (QEMU: $needs_qemu)"
+          echo "Platforms: $PLATFORMS (native runners: $NATIVE_RUNNERS, QEMU: $needs_qemu)"
           echo "Cache scope: $scope"
 
-      - name: Docker meta
+      - &meta
+        name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
         with:
@@ -232,10 +279,12 @@ jobs:
         if: steps.config.outputs.needs-qemu == 'true'
         uses: docker/setup-qemu-action@v4
 
-      - name: Set up Docker Buildx
+      - &setup-buildx
+        name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Login to GitHub Container Registry
+      - &login-ghcr
+        name: Login to GitHub Container Registry
         if: inputs.push && steps.config.outputs.needs-ghcr-login == 'true'
         uses: docker/login-action@v4
         with:
@@ -243,12 +292,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
+      - &login-dockerhub
+        name: Login to Docker Hub
         if: inputs.push && steps.config.outputs.needs-dockerhub-login == 'true'
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - &record-replaced
+        name: Record the images the tags point to now
+        if: inputs.push && inputs.cleanup-replaced && steps.config.outputs.needs-ghcr-login == 'true'
+        continue-on-error: true # cleanup is best effort, it must never fail the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGES: ${{ steps.config.outputs.images }}
+          TAG_LIST: ${{ steps.config.outputs.tag-list }}
+        run: |
+          # Writes "<image> <tag> <digest>" for every ghcr.io tag that exists already, so that the step
+          # "Delete replaced images" can delete what this push replaces.
+          record="$RUNNER_TEMP/docker-image-replaced.tsv"
+          : > "$record"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          while IFS= read -r image; do
+            [ "${image%%/*}" = "ghcr.io" ] || continue
+            repo=$(tr '[:upper:]' '[:lower:]' <<< "${image#ghcr.io/}")
+            if ! token=$(curl -fsS -u "$GITHUB_ACTOR:$GH_TOKEN" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:$repo:pull" | jq -er .token); then
+              echo "::warning::Could not get a registry token for $image, so replaced images are not deleted"
+              continue
+            fi
+            while IFS= read -r tag; do
+              [ -n "$tag" ] || continue
+              read -r status digest < <(curl -sS -o /dev/null -I -H "Authorization: Bearer $token" -H "Accept: $accept" \
+                -w '%{http_code} %header{docker-content-digest}\n' "https://ghcr.io/v2/$repo/manifests/$tag")
+              if [ "$status" = "200" ] && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "$image:$tag is $digest"
+                printf '%s\t%s\t%s\n' "$image" "$tag" "$digest" >> "$record"
+              else
+                echo "$image:$tag does not exist yet (HTTP $status)"
+              fi
+            done <<< "$TAG_LIST"
+          done <<< "$IMAGES"
 
       - name: Build and push image
         id: build
@@ -263,3 +348,306 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}
           cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }},ignore-error=true
+
+      - &delete-replaced
+        name: Delete replaced images
+        if: inputs.push && inputs.cleanup-replaced && steps.config.outputs.needs-ghcr-login == 'true'
+        continue-on-error: true # cleanup is best effort, it must never fail the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGES: ${{ steps.config.outputs.images }}
+          NEW_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # Candidates are the digests the tags pointed to before this push (step "Record the images the tags point
+          # to now") and, with native runners, the per-platform images that were pushed by digest and merged.
+          # A candidate is deleted only if it is not the new image, its package version has no tag left and no
+          # tagged image references it. Then its child manifests (platforms, attestations) are deleted, except those
+          # that the new image or another tagged image still references (with reproducible builds a platform
+          # manifest can be identical between builds) or that carry a tag themselves.
+          # A tagged image can only reference a manifest that existed when it was pushed. Package versions are listed
+          # newest first, so only the tagged versions listed down to the oldest candidate have to be inspected.
+          record="$RUNNER_TEMP/docker-image-replaced.tsv"
+          intermediate="$RUNNER_TEMP/docker-image-intermediate.txt"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          max_pages=50
+          work=$(mktemp -d)
+          touch "$record" "$intermediate"
+
+          if ! [[ "$NEW_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::warning::No digest of the new image, so replaced images are not deleted"
+            exit 0
+          fi
+
+          # manifest_children <repo> <registry token> <digest>: the digests an image index refers to (none for a
+          # single-platform manifest). Fails if the manifest cannot be read.
+          manifest_children() {
+            local manifest
+            manifest=$(curl -fsS -H "Authorization: Bearer $2" -H "Accept: $accept" "https://ghcr.io/v2/$1/manifests/$3") || return 1
+            jq -r '.manifests[]?.digest' <<< "$manifest"
+          }
+
+          while IFS= read -r image; do
+            [ "${image%%/*}" = "ghcr.io" ] || continue
+            repo=$(tr '[:upper:]' '[:lower:]' <<< "${image#ghcr.io/}")
+            owner="${repo%%/*}"
+            package="${repo#*/}"
+
+            { awk -F'\t' -v image="$image" '$1 == image { print $3 }' "$record"; cat "$intermediate"; } \
+              | grep -vxF "$NEW_DIGEST" | sort -u > "$work/candidates"
+            if ! [ -s "$work/candidates" ]; then
+              echo "$image: no image was replaced"
+              continue
+            fi
+
+            if ! token=$(curl -fsS -u "$GITHUB_ACTOR:$GH_TOKEN" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:$repo:pull" | jq -er .token); then
+              echo "::warning::$image: could not get a registry token, so replaced images are not deleted"
+              continue
+            fi
+
+            # digests that must stay: the new image and its children (more are added below)
+            if ! new_children=$(manifest_children "$repo" "$token" "$NEW_DIGEST"); then
+              echo "::warning::$image: could not read the new image $NEW_DIGEST, so replaced images are not deleted"
+              continue
+            fi
+            printf '%s\n' "$NEW_DIGEST" "$new_children" | sed '/^$/d' > "$work/referenced"
+
+            # children of the candidates, as "<candidate> <child>"
+            : > "$work/children"
+            : > "$work/unreadable"
+            while IFS= read -r candidate; do
+              if kids=$(manifest_children "$repo" "$token" "$candidate"); then
+                for kid in $kids; do
+                  printf '%s %s\n' "$candidate" "$kid" >> "$work/children"
+                done
+              else
+                echo "$candidate" >> "$work/unreadable"
+              fi
+            done < "$work/candidates"
+
+            # the package versions to find: the candidates and their children that the new image does not use
+            { cat "$work/candidates"; cut -d' ' -f2 "$work/children"; } | sort -u \
+              | grep -vxFf "$work/referenced" > "$work/needed" || true
+
+            # list the package versions (newest first) until all needed versions are found, as "<id> <digest> <tags>"
+            api="/orgs/$owner/packages/container/${package//\//%2F}"
+            gh api --silent "$api" 2>/dev/null || api="/users/$owner/packages/container/${package//\//%2F}"
+            list_ok=true
+            for attempt in 1 2 3; do
+              : > "$work/versions"
+              page=1
+              while [ "$page" -le "$max_pages" ]; do
+                if ! gh api "$api/versions?per_page=100&page=$page" \
+                  --jq '.[] | [.id, .name, (.metadata.container.tags | join(","))] | @tsv' > "$work/page"; then
+                  list_ok=false
+                  break
+                fi
+                [ -s "$work/page" ] || break
+                cat "$work/page" >> "$work/versions"
+                if [ -z "$(cut -f2 "$work/versions" | sort -u | comm -13 - <(sort -u "$work/needed"))" ]; then
+                  break
+                fi
+                page=$((page + 1))
+              done
+              $list_ok || break
+              # The packages API can lag behind the registry for a moment. If a replaced version still lists a tag
+              # that this push moved away from it, the listing is stale: try again.
+              stale=$(awk -F'\t' -v image="$image" -v new="$NEW_DIGEST" \
+                'NR == FNR { if ($1 == image && $3 != new) moved[$3] = moved[$3] "," $2 ","; next }
+                ($2 in moved) { n = split($3, t, ","); for (i = 1; i <= n; i++) if (index(moved[$2], "," t[i] ",")) { print $2; exit } }' \
+                "$record" "$work/versions")
+              [ -n "$stale" ] && [ "$attempt" -lt 3 ] || break
+              echo "$image: the package listing does not show the new tags yet, retrying in 10 seconds"
+              sleep 10
+            done
+            if ! $list_ok; then
+              echo "::warning::$image: could not list the package versions, so replaced images are not deleted"
+              continue
+            fi
+
+            # digests referenced by tagged images that were pushed after the oldest needed version
+            oldest=$(awk -F'\t' 'NR == FNR { needed[$1] = 1; next } ($2 in needed) { print $1 }' "$work/needed" "$work/versions" | sort -n | head -n 1)
+            safe=true
+            if [ -n "$oldest" ]; then
+              while IFS=$'\t' read -r id digest tags; do
+                [ -n "$tags" ] && [ "$id" -ge "$oldest" ] || continue
+                echo "$digest" >> "$work/referenced"
+                if grep -qxF "$digest" "$work/candidates"; then
+                  awk -v d="$digest" '$1 == d { print $2 }' "$work/children" >> "$work/referenced"
+                elif kids=$(manifest_children "$repo" "$token" "$digest"); then
+                  [ -z "$kids" ] || printf '%s\n' "$kids" >> "$work/referenced"
+                else
+                  safe=false
+                fi
+              done < "$work/versions"
+            fi
+            if ! $safe; then
+              echo "::warning::$image: could not read all tagged images, so no child manifests are deleted"
+            fi
+
+            : > "$work/deleted"
+            # delete_version <digest> <what>: deletes the package version of the digest if it is unused
+            delete_version() {
+              local line id tags
+              if grep -qxF "$1" "$work/deleted"; then return 0; fi
+              if grep -qxF "$1" "$work/referenced"; then
+                echo "  kept $2 $1: still used by a tagged image"
+                return 1
+              fi
+              line=$(awk -F'\t' -v d="$1" '$2 == d { print $1 "\t" $3; exit }' "$work/versions")
+              if [ -z "$line" ]; then
+                echo "  kept $2 $1: not found among the newest package versions"
+                return 1
+              fi
+              IFS=$'\t' read -r id tags <<< "$line"
+              if [ -n "$tags" ]; then
+                echo "  kept $2 $1: still tagged $tags"
+                return 1
+              fi
+              if gh api --silent --method DELETE "$api/versions/$id"; then
+                echo "  deleted $2 $1 (package version $id)"
+                echo "$1" >> "$work/deleted"
+              else
+                echo "::warning::$image: could not delete package version $id ($1)"
+                return 1
+              fi
+            }
+
+            echo "$image (new image: $NEW_DIGEST):"
+            while IFS= read -r candidate; do
+              if grep -qxF "$candidate" "$work/unreadable"; then
+                echo "  kept image $candidate: could not read its manifest"
+                continue
+              fi
+              delete_version "$candidate" image || continue
+              $safe || continue
+              while IFS= read -r kid; do
+                delete_version "$kid" "child manifest" || true
+              done < <(awk -v d="$candidate" '$1 == d { print $2 }' "$work/children")
+            done < "$work/candidates"
+          done <<< "$IMAGES"
+
+  # Native-runner mode, part 1: one job per platform (check name `<caller job> / build-native (<platform>)`), each
+  # pushes its image by digest only. Do not rename within v1.
+  build-native:
+    if: inputs.native-runners
+    name: build-native (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Expressions cannot split strings, so the two supported platforms are picked by `contains`.
+        # Any other platform is rejected by the step "Compute tags and settings".
+        platform: ${{ fromJSON(contains(inputs.platforms, 'linux/arm64') && (contains(inputs.platforms, 'linux/amd64') && '["linux/amd64","linux/arm64"]' || '["linux/arm64"]') || '["linux/amd64"]') }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - *checkout
+      - *download-artifact
+      - *prepare
+      - *config
+      - *meta
+      - *setup-buildx
+      - *login-ghcr
+      - *login-dockerhub
+
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: ${{ inputs.push && format('type=image,"name={0}",push-by-digest=true,name-canonical=true,push=true', steps.config.outputs.image-names) || 'type=cacheonly' }}
+          cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+          cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }},ignore-error=true
+
+      - name: Export digest
+        if: inputs.push
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected image digest '$DIGEST'"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: inputs.push
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-image-digests-${{ steps.config.outputs.cache-scope }}--${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  # Native-runner mode, part 2: creates the multi-platform image with all tags (check name `<caller job> / merge`).
+  # Do not rename within v1.
+  merge:
+    if: inputs.native-runners && inputs.push
+    needs: build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io, delete replaced images
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - *config
+      - *meta
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: docker-image-digests-${{ steps.config.outputs.cache-scope }}--*
+          merge-multiple: true
+
+      - *setup-buildx
+      - *login-ghcr
+      - *login-dockerhub
+      - *record-replaced
+
+      - name: Create multi-platform image
+        id: build
+        env:
+          IMAGES: ${{ steps.config.outputs.images }}
+          TAG_LIST: ${{ steps.config.outputs.tag-list }}
+          DIGEST_DIR: ${{ runner.temp }}/digests
+        run: |
+          mapfile -t digests < <(find "$DIGEST_DIR" -maxdepth 1 -type f -printf 'sha256:%f\n' | sort)
+          if [ "${#digests[@]}" -eq 0 ]; then
+            echo "::error::No per-platform image digests found"
+            exit 1
+          fi
+          # The per-platform pushes are deleted afterwards if they are not part of the new image (cleanup-replaced).
+          printf '%s\n' "${digests[@]}" > "$RUNNER_TEMP/docker-image-intermediate.txt"
+          mapfile -t tags <<< "$TAG_LIST"
+          first=""
+          while IFS= read -r image; do
+            args=()
+            for tag in "${tags[@]}"; do
+              [ -z "$tag" ] || args+=(--tag "$image:$tag")
+            done
+            for digest in "${digests[@]}"; do
+              args+=("$image@$digest")
+            done
+            docker buildx imagetools create "${args[@]}"
+            [ -n "$first" ] || first="$image:${tags[0]}"
+          done <<< "$IMAGES"
+          docker buildx imagetools inspect "$first"
+          digest=$(docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' | jq -r .digest)
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not determine the digest of $first"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - *delete-replaced
