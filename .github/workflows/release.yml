@@ -1,0 +1,255 @@
+# Creates the next release or prerelease of the calling repository with semantic-release.
+# See README.md in this folder for the release modes (auto / manual) and examples.
+#
+# - `type: release`: a full release from the default branch. Before it, prereleases of the transition
+#   (`*-<prerelease-id>.*`, `*-master.*`) are deleted (GitHub releases and git tags), unless `cleanup-prereleases: false`.
+# - `type: prerelease`: a prerelease `<next version>-<prerelease-id>.<n>` (e.g. `1.4.0-edge.3`) from the default branch.
+#
+# Only the `branches` setting is overridden here; the plugins and everything else stay in the repository's own
+# semantic-release configuration (`.releaserc*`, `release.config.*` or package.json).
+#
+# Why prereleases are not made by semantic-release itself: semantic-release requires at least one existing *release*
+# branch next to a prerelease branch, so the default branch alone cannot be configured as a prerelease branch. Instead,
+# a dry run with the default branch as release branch computes the next version and its release notes, and this
+# workflow creates the prerelease tag and GitHub prerelease. The repository's prepare/publish/success plugins
+# therefore only run for full releases (e.g. no "released in" comments on issues for prereleases).
+#
+# The release (or prerelease) is created with the `token` PAT: releases created with the GITHUB_TOKEN would not trigger
+# the `release: published` workflow that builds the image.
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      type:
+        type: string
+        required: true
+        description: "`release` (full release) or `prerelease`"
+      prerelease-id:
+        type: string
+        required: false
+        default: edge
+        description: Prerelease identifier, as in `1.4.0-edge.3`
+      cleanup-prereleases:
+        type: boolean
+        required: false
+        default: true
+        description: >-
+          Only for `type: release`: before releasing, delete the GitHub prereleases and git tags matching
+          `*-<prerelease-id>.*` or `*-master.*`
+      extra-plugins:
+        type: string
+        required: false
+        default: ""
+        description: semantic-release plugins to install that the configuration uses (one per line, optionally `@version`)
+      node-version-file:
+        type: string
+        required: false
+        default: .nvmrc
+        description: File with the Node.js version to run semantic-release with. If it does not exist, the latest LTS is used.
+    secrets:
+      token:
+        required: true
+        description: >-
+          PAT that may push tags and create releases (and comment on issues/PRs, if the configuration does that).
+          Not the GITHUB_TOKEN: its releases trigger no workflows.
+      slack-webhook:
+        required: false
+        description: Slack webhook URL, available to the plugins as the environment variable `SLACK_WEBHOOK`
+    outputs:
+      version:
+        description: The version that was released (empty if none)
+        value: ${{ jobs.release.outputs.version }}
+      published:
+        description: "`true` if a release or prerelease was created, else `false`"
+        value: ${{ jobs.release.outputs.published }}
+
+jobs:
+  # The job id is part of the check name (`<caller job> / release`). Do not rename it within v1.
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # everything that writes uses the `token` secret
+    # Releases of one repository must not run in parallel (they would compute the same version).
+    # Separate groups per type, so that a prerelease of a later push never replaces a pending manual release.
+    concurrency:
+      group: semantic-release-${{ github.repository }}-${{ inputs.type }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.result.outputs.version }}
+      published: ${{ steps.result.outputs.published }}
+    steps:
+      - name: Check inputs
+        id: config
+        env:
+          TYPE: ${{ inputs.type }}
+          PRERELEASE_ID: ${{ inputs.prerelease-id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ secrets.token }}
+        run: |
+          case "$TYPE" in
+            release | prerelease) ;;
+            *)
+              echo "::error::Input 'type' must be 'release' or 'prerelease', not '$TYPE'"
+              exit 1
+              ;;
+          esac
+          if ! [[ "$PRERELEASE_ID" =~ ^[0-9A-Za-z-]+$ ]]; then
+            echo "::error::Invalid 'prerelease-id' '$PRERELEASE_ID' (letters, digits and hyphens only)"
+            exit 1
+          fi
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            DEFAULT_BRANCH=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          fi
+          on_default_branch=false
+          if [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+            on_default_branch=true
+          else
+            echo "::notice::Releases are only created from the default branch '$DEFAULT_BRANCH', not from '$GITHUB_REF'"
+          fi
+          {
+            echo "default-branch=$DEFAULT_BRANCH"
+            echo "on-default-branch=$on_default_branch"
+            # The prerelease is computed by a dry run with the default branch as release branch (see top of the file).
+            echo "branches=$(jq -cn --arg name "$DEFAULT_BRANCH" '[{name: $name, prerelease: false}]')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete prereleases
+        if: inputs.type == 'release' && inputs.cleanup-prereleases && steps.config.outputs.on-default-branch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          PRERELEASE_ID: ${{ inputs.prerelease-id }}
+        run: |
+          is_prerelease_tag() { [[ "$1" == *-"$PRERELEASE_ID".* || "$1" == *-master.* ]]; }
+
+          gh release list -R "$GITHUB_REPOSITORY" --limit 1000 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' > "$RUNNER_TEMP/prereleases"
+          while IFS= read -r tag; do
+            is_prerelease_tag "$tag" || continue
+            echo "Deleting prerelease and tag $tag"
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done < "$RUNNER_TEMP/prereleases"
+
+          # tags without a release (e.g. its release was deleted manually)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/" --jq '.[].ref' > "$RUNNER_TEMP/tags"
+          while IFS= read -r ref; do
+            tag="${ref#refs/tags/}"
+            is_prerelease_tag "$tag" || continue
+            echo "Deleting tag $tag"
+            gh api --silent --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" || echo "::warning::Could not delete tag $tag"
+          done < "$RUNNER_TEMP/tags"
+
+      # after deleting prereleases, so that the deleted tags are not in the clone
+      - name: Checkout repository
+        if: steps.config.outputs.on-default-branch == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # semantic-release pushes with the `token` (passed as GITHUB_TOKEN below), not the job's token
+          persist-credentials: false
+
+      - name: Determine Node.js version
+        id: node
+        if: steps.config.outputs.on-default-branch == 'true'
+        env:
+          NODE_VERSION_FILE: ${{ inputs.node-version-file }}
+        run: |
+          if [ -f "$NODE_VERSION_FILE" ]; then
+            echo "file=$NODE_VERSION_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "No $NODE_VERSION_FILE, using the latest Node.js LTS"
+            echo "file=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.config.outputs.on-default-branch == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ steps.node.outputs.file }}
+          node-version: ${{ steps.node.outputs.file == '' && 'lts/*' || '' }}
+
+      - name: Set up npm from packageManager
+        if: steps.config.outputs.on-default-branch == 'true' && hashFiles('package.json') != ''
+        run: |
+          package_manager=$(jq -r '.packageManager // ""' package.json)
+          if [[ "$package_manager" =~ ^npm@([0-9]+\.[0-9]+\.[0-9]+[^+]*) ]]; then
+            echo "Installing npm ${BASH_REMATCH[1]} (packageManager in package.json)"
+            npm install --global "npm@${BASH_REMATCH[1]}"
+          fi
+          npm --version
+
+      - name: Semantic Release
+        id: semantic
+        if: steps.config.outputs.on-default-branch == 'true'
+        uses: cycjimmy/semantic-release-action@1989a0fefc4aea321e07f717680ed8e345925dc1 # v7.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.token }}
+          SLACK_WEBHOOK: ${{ secrets.slack-webhook }}
+        with:
+          branches: ${{ steps.config.outputs.branches }}
+          extra_plugins: ${{ inputs.extra-plugins }}
+          dry_run: ${{ inputs.type == 'prerelease' }}
+
+      - name: Create prerelease
+        id: prerelease
+        if: inputs.type == 'prerelease' && steps.semantic.outputs.new_release_published == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          PRERELEASE_ID: ${{ inputs.prerelease-id }}
+          NEXT_VERSION: ${{ steps.semantic.outputs.new_release_version }}
+          NEXT_TAG: ${{ steps.semantic.outputs.new_release_git_tag }}
+          NOTES: ${{ steps.semantic.outputs.new_release_notes }}
+        run: |
+          if [[ "$NEXT_TAG" != *"$NEXT_VERSION" ]]; then
+            echo "::error::The tag format must end with the version (next tag '$NEXT_TAG', version '$NEXT_VERSION')"
+            exit 1
+          fi
+          # Re-runs and pushes without new commits must not create another prerelease of the same commit.
+          existing=$(git tag --points-at "$GITHUB_SHA" | grep -E -- "-$PRERELEASE_ID\.[0-9]+$" | head -n 1 || true)
+          if [ -n "$existing" ]; then
+            echo "::notice::$GITHUB_SHA already is prerelease $existing"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prefix="$NEXT_TAG-$PRERELEASE_ID."
+          last=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$prefix" --jq '.[].ref' \
+            | sed "s|^refs/tags/||" | while IFS= read -r tag; do
+                suffix="${tag#"$prefix"}"
+                [[ "$suffix" =~ ^[0-9]+$ ]] && echo "$suffix"
+              done | sort -n | tail -n 1)
+          number=$(( ${last:-0} + 1 ))
+          tag="$prefix$number"
+          version="$NEXT_VERSION-$PRERELEASE_ID.$number"
+
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+          echo "Creating prerelease $tag"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "$tag" --notes-file "$RUNNER_TEMP/notes.md"
+          {
+            echo "version=$version"
+            echo "published=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Result
+        id: result
+        env:
+          TYPE: ${{ inputs.type }}
+          RELEASE_VERSION: ${{ steps.semantic.outputs.new_release_version }}
+          RELEASE_PUBLISHED: ${{ steps.semantic.outputs.new_release_published }}
+          PRERELEASE_VERSION: ${{ steps.prerelease.outputs.version }}
+          PRERELEASE_PUBLISHED: ${{ steps.prerelease.outputs.published }}
+        run: |
+          if [ "$TYPE" = "prerelease" ]; then
+            version="$PRERELEASE_VERSION"
+            published="${PRERELEASE_PUBLISHED:-false}"
+          else
+            version="$RELEASE_VERSION"
+            published="${RELEASE_PUBLISHED:-false}"
+          fi
+          [ "$published" = "true" ] || version=""
+          echo "Published: $published ${version}"
+          {
+            echo "version=$version"
+            echo "published=$published"
+          } >> "$GITHUB_OUTPUT"
