@@ -38,8 +38,10 @@ titles (squash merge, see `pr-title-lint.yml`). There are two modes:
 
 - **auto**: every push to the default branch that contains a `fix`/`feat`/breaking change is released right away
   (`release.yml` with `type: release` on push).
-- **manual**: every such push creates a **prerelease** `<next version>-edge.<n>`, e.g. `1.4.0-edge.3`
-  (`release.yml` with `type: prerelease` on push). A full release is created by running the release workflow by hand
+- **manual**: pushes to the default branch create **prereleases** `<next version>-edge.<n>`, e.g. `1.4.0-edge.3`
+  (`release.yml` with `type: prerelease` on push). As soon as there is any `fix`/`feat`/breaking change since the last
+  full release, *every* later push creates the next prerelease (and image), also a push with only `chore`/`docs`
+  commits; see `release.yml` below. A full release is created by running the release workflow by hand
   (`workflow_dispatch`, `type: release`). It first deletes the `*-edge.*` prereleases and tags (and the `*-master.*` ones
   of the old naming), then releases the next version. After the full release, `image-prune.yml` deletes the
   prerelease images.
@@ -76,7 +78,9 @@ the workflow records the digest each tag points to; after pushing, every such im
 **no tag left** is deleted, together with its platform and attestation manifests unless the new image or another tagged
 image still references them (with reproducible builds a platform manifest can be the same between builds). So the
 previous `pr-<n>` image disappears as soon as a new push to the PR replaces it, while moving `edge`, `latest` or
-`stable` never deletes anything: the previous image keeps its version tag. With `native-runners`, the per-platform
+`stable` deletes nothing as long as every build also passes `version`: the previous image keeps its version tag.
+An image that carries **only** moving tags (e.g. a branch build tagged just `main`) is deleted when the next push
+moves its last tag; pass `version` or set `cleanup-replaced: false` if such images must be kept. With `native-runners`, the per-platform
 images pushed by digest are deleted after merging as well (their manifests are part of the new image). Every deletion
 is logged in the step "Delete replaced images"; a failure there only produces a warning, never a failed build.
 
@@ -208,7 +212,9 @@ nothing (`published: false`).
   with the default branch as release branch computes the next version and release notes, and this workflow creates
   the tag and the GitHub prerelease (with the PAT, so that `release: published` builds the image). `<n>` continues
   after the highest existing `<next version>-<prerelease-id>.*` tag. If the commit already has such a prerelease tag
-  (e.g. a re-run), nothing is created. The repository's `prepare`/`publish`/`success` plugins run only for full
+  (e.g. a re-run), nothing is created. Unlike semantic-release's own prerelease branches, which only release when
+  there are releasable commits since the last *prerelease*, this compares with the last *full* release: once there is
+  a releasable change, every push to the default branch creates a new prerelease. The repository's `prepare`/`publish`/`success` plugins run only for full
   releases, so prereleases do not comment on issues or PRs.
 
 Required permissions of the calling job: `contents: read`. Everything that writes uses the `token` secret
