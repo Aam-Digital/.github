@@ -54,9 +54,11 @@ jobs:
     permissions:
       actions: write # cancel unfinished PR builds (build-workflows)
       packages: write # delete package versions
-    # ghcr-cleanup-action is not safe to run in parallel against the same package
+    # Serialize runs for the same PR only. A group per package would cancel cleanups: GitHub keeps just one pending
+    # run per group, and a run can wait here for PR builds for minutes. Parallel runs for different tags are safe
+    # enough: a manifest shared with another image is never deleted (at worst it is left behind).
     concurrency:
-      group: ghcr-cleanup-${{ github.repository }}-${{ inputs.packages || github.event.repository.name }}
+      group: ghcr-cleanup-${{ github.repository }}-${{ inputs.tags || github.event.pull_request.number }}
       cancel-in-progress: false
     steps:
       - name: Determine packages and tags
