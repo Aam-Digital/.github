@@ -21,15 +21,19 @@ Reusable workflows for all Aam-Digital repositories, so that each repository kee
   This way a push to this repository (e.g. an edit of the org profile README) does not change CI everywhere.
 - **Permissions:** a called workflow cannot get more permissions than the calling job has.
   The calling job (or the caller workflow's top-level `permissions`) must grant at least what is listed for each
-  workflow below, otherwise the run fails before it starts.
+  workflow below, otherwise the run fails before it starts. Callers should set `permissions: {}` at the top level of
+  the workflow and grant the permissions per job (as in all examples below); without a top-level `permissions`,
+  checkov (`CKV2_GHA_1`, blocking in `qlty check`) flags the workflow. Jobs of the caller that are not shown in an
+  example (tests, ...) need their own `permissions`, e.g. `contents: read`.
 - **Secrets and `env`** of the caller are not passed through. Everything a workflow needs is an input or an explicitly
   passed secret.
 - **Check names:** GitHub names the check of a job in a called workflow `<caller job> / <called job>`, where each part is
   the job's `name` if it has one, else its id. The called job ids/names listed above are part of the `v1` contract.
   If you move an existing job into one of these workflows, either keep the caller job's name so that the check name is
   what the repository's ruleset expects, or update the required status checks in the same PR. Otherwise PRs wait
-  forever for a check that never reports. Jobs of the mode that is not used (e.g. `merge` without `native-runners`)
-  report as skipped; a skipped required check counts as passed.
+  forever for a check that never reports. Jobs of the mode that is not used (e.g. `merge` and `build-native` without
+  `native-runners`) report as skipped (`<caller job> / build-native`, without the platform); a skipped required check
+  counts as passed.
 
 ## Release model
 
@@ -124,6 +128,8 @@ needed). `pr-image-cleanup.yml` never deletes an image that carries another tag.
 on:
   pull_request:
 
+permissions: {} # each job grants what it needs
+
 jobs:
   build:
     uses: Aam-Digital/.github/.github/workflows/docker-image.yml@v1
@@ -143,6 +149,8 @@ jobs:
 on:
   release:
     types: [published] # the release must be created with a PAT, GITHUB_TOKEN releases trigger no workflows
+
+permissions: {} # each job grants what it needs
 
 jobs:
   build:
@@ -170,6 +178,8 @@ jobs:
 ### Example: several registries, artifact from an earlier job
 
 ```yaml
+permissions: {} # each job grants what it needs
+
 jobs:
   build-webapp:
     # ... uploads the artifact "webapp-files"
@@ -201,8 +211,10 @@ Creates the next release or prerelease with semantic-release
 ([`cycjimmy/semantic-release-action`](https://github.com/cycjimmy/semantic-release-action)). Only the semantic-release
 `branches` setting comes from this workflow (the caller's default branch); the plugins and everything else stay in the
 repository's own configuration (`.releaserc*`, `release.config.*` or `release` in package.json), including `tagFormat`
-(which must end with the version). Releases are only created from the default branch; on any other ref the job does
-nothing (`published: false`).
+(which must end with the version). Releases are only created from the default branch: on any other ref the job is
+**skipped** by the workflow itself (no gate needed in the caller; the outputs are empty then). Skipping, rather than
+a no-op run, matters: GitHub keeps only one *pending* run per concurrency group, so a no-op run of a push to another
+branch could otherwise replace a release that is waiting. The concurrency group is per repository, ref and type.
 
 - `type: release`: a full release of the default branch (`branches: [{name: <default>, prerelease: false}]`).
   With `cleanup-prereleases` (default), the GitHub prereleases and git tags matching `*-<prerelease-id>.*` or
@@ -234,7 +246,7 @@ write access). Releases of one repository and type are serialised (concurrency g
 | `token`         | (required) PAT for tags, releases (and comments). Not the `GITHUB_TOKEN`. |
 | `slack-webhook` | Optional, available to plugins as `SLACK_WEBHOOK` (e.g. `semantic-release-slack-bot`) |
 
-Outputs: `version` (the released version, empty if none), `published` (`true`/`false`).
+Outputs: `version` (the released version, empty if none), `published` (`true`/`false`; empty if the job was skipped on a non-default branch).
 
 ### Example: manual release mode
 
@@ -243,6 +255,8 @@ Outputs: `version` (the released version, empty if none), `published` (`true`/`f
 on:
   push:
     branches: [main]
+
+permissions: {} # each job grants what it needs
 
 jobs:
   # ... tests
@@ -261,6 +275,8 @@ jobs:
 # .github/workflows/release.yml
 on:
   workflow_dispatch:
+
+permissions: {} # each job grants what it needs
 
 jobs:
   release:
@@ -282,6 +298,8 @@ jobs:
 on:
   push:
     branches: [main]
+
+permissions: {} # each job grants what it needs
 
 jobs:
   # ... tests
@@ -350,6 +368,8 @@ on:
   pull_request:
     types: [closed]
 
+permissions: {} # each job grants what it needs
+
 jobs:
   cleanup-image:
     # PRs from forks have no image (and their token cannot delete packages)
@@ -383,6 +403,8 @@ on:
   pull_request_target: # zizmor: ignore[dangerous-triggers] never checks out PR code, only reads the PR title from the event payload
     types: [opened, edited, synchronize, reopened]
 
+permissions: {} # each job grants what it needs
+
 jobs:
   pr-title:
     uses: Aam-Digital/.github/.github/workflows/pr-title-lint.yml@v1
@@ -403,6 +425,8 @@ on:
   pull_request:
   push:
     branches: [main]
+
+permissions: {} # each job grants what it needs
 
 jobs:
   actionlint:

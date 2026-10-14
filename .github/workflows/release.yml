@@ -61,19 +61,24 @@ on:
         description: The version that was released (empty if none)
         value: ${{ jobs.release.outputs.version }}
       published:
-        description: "`true` if a release or prerelease was created, else `false`"
+        description: "`true` if a release or prerelease was created, `false` if there was nothing to release (empty if the job was skipped because the ref is not the default branch)"
         value: ${{ jobs.release.outputs.published }}
 
 jobs:
   # The job id is part of the check name (`<caller job> / release`). Do not rename it within v1.
   release:
+    # Only the default branch is released. Skipping the job on any other ref (instead of a no-op run inside it)
+    # also keeps it out of the concurrency group below: GitHub keeps just one *pending* run per group, so a no-op run
+    # of a push to another branch would otherwise replace a release that is waiting for the default branch.
+    # (`published` is empty, not `false`, when the job is skipped.)
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
       contents: read # everything that writes uses the `token` secret
     # Releases of one repository must not run in parallel (they would compute the same version).
-    # Separate groups per type, so that a prerelease of a later push never replaces a pending manual release.
+    # Separate groups per type and ref, so that a prerelease of a later push never replaces a pending manual release.
     concurrency:
-      group: semantic-release-${{ github.repository }}-${{ inputs.type }}
+      group: semantic-release-${{ github.repository }}-${{ github.ref }}-${{ inputs.type }}
       cancel-in-progress: false
     outputs:
       version: ${{ steps.result.outputs.version }}

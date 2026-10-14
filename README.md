@@ -5,7 +5,7 @@ Shared configuration for the repositories of the Aam-Digital organisation.
 
 | Folder / file | What |
 | --- | --- |
-| [`.github/workflows/`](.github/workflows) | Reusable GitHub Actions workflows (container images, releases, image cleanup, PR title and workflow linting). See its [README](.github/workflows/README.md) for inputs, permissions, check names, the release model and how the `v1` tag is moved. |
+| [`.github/workflows/`](.github/workflows) | Reusable GitHub Actions workflows (container images, releases, image cleanup, PR title and workflow linting). See its [README](.github/workflows/README.md) for inputs, permissions, check names, the release model and how the `v1` tag is moved. Callers set top-level `permissions: {}` and grant permissions per job. |
 | [`renovate/`](renovate) | Shared Renovate presets (below) |
 | [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE), [`SECURITY.md`](SECURITY.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Organisation-wide defaults (below) |
 

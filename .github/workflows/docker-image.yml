@@ -535,7 +535,9 @@ jobs:
   # pushes its image by digest only. Do not rename within v1.
   build-native:
     if: inputs.native-runners
-    name: build-native (${{ matrix.platform }})
+    # No `name` with a matrix expression: GitHub appends the matrix value itself (`build-native (linux/amd64)`),
+    # while the jobs skipped without native-runners would show the unexpanded expression.
+    name: build-native
     strategy:
       fail-fast: false
       matrix:
