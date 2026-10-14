@@ -121,6 +121,12 @@ on:
       DOCKERHUB_TOKEN:
         required: false
         description: Docker Hub access token (or password) for DOCKERHUB_USERNAME
+      BUILD_SECRETS:
+        required: false
+        description: >-
+          Secrets for the build as BuildKit secrets (`id=value`, one per line; the format of build-push-action's
+          `secrets` input), e.g. `sentry_auth_token=<token>`. Read in the Dockerfile with
+          `RUN --mount=type=secret,id=sentry_auth_token ...`. Masked in the logs; unset or empty passes no secret.
     outputs:
       digest:
         description: Digest of the built image (the multi-platform index if more than one platform was built)
@@ -141,6 +147,18 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
+      - &mask-build-secrets
+        name: Mask build secrets
+        env:
+          BUILD_SECRETS: ${{ secrets.BUILD_SECRETS }}
+        run: |
+          # Every value is masked in the logs, also if the caller composed BUILD_SECRETS (`format(...)`) from
+          # a secret and GitHub does not know the composed value as a secret. Nothing is printed.
+          while IFS= read -r line; do
+            value="${line#*=}"
+            [ -z "$value" ] || echo "::add-mask::$value"
+          done <<< "$BUILD_SECRETS"
+
       - &checkout
         name: Checkout repository
         uses: actions/checkout@v7
@@ -346,6 +364,7 @@ jobs:
           push: ${{ inputs.push }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          secrets: ${{ secrets.BUILD_SECRETS }}
           cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}
           cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }},ignore-error=true
 
@@ -549,6 +568,7 @@ jobs:
       contents: read
       packages: write # push to ghcr.io
     steps:
+      - *mask-build-secrets
       - *checkout
       - *download-artifact
       - *prepare
@@ -567,6 +587,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: ${{ inputs.build-args }}
           labels: ${{ steps.meta.outputs.labels }}
+          secrets: ${{ secrets.BUILD_SECRETS }}
           outputs: ${{ inputs.push && format('type=image,"name={0}",push-by-digest=true,name-canonical=true,push=true', steps.config.outputs.image-names) || 'type=cacheonly' }}
           cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
           cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }},ignore-error=true

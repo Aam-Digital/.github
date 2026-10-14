@@ -115,6 +115,7 @@ repository's workflow pushed first). Without that access it only warns.
 | -------------------- | ----------- |
 | `DOCKERHUB_USERNAME` | Only for images on Docker Hub |
 | `DOCKERHUB_TOKEN`    | Only for images on Docker Hub |
+| `BUILD_SECRETS`      | Optional BuildKit secrets for the build: `id=value`, one per line (the format of build-push-action's `secrets` input). Used in the Dockerfile with `RUN --mount=type=secret,id=<id> ...`. Passed to the build in both modes (`build` and every `build-native` job). Every value is masked in the logs (not only when GitHub knows it as a secret) and never printed. Unset or empty: no secret is passed. |
 
 Outputs: `digest` (of the pushed image or multi-platform index), `tags` (all `<image>:<tag>` references, one per line).
 
@@ -174,6 +175,27 @@ jobs:
     permissions:
       packages: write
 ```
+
+### Example: build secrets (e.g. uploading Sentry source bundles from inside the Dockerfile)
+
+```yaml
+# Dockerfile: RUN --mount=type=secret,id=sentry_auth_token SENTRY_AUTH_TOKEN="$(cat /run/secrets/sentry_auth_token)" ...
+jobs:
+  build:
+    uses: Aam-Digital/.github/.github/workflows/docker-image.yml@v1
+    permissions:
+      contents: read
+      packages: write
+    secrets:
+      # not for PR builds: forks cannot read the secret, and PR images are never deployed
+      BUILD_SECRETS: ${{ github.event_name != 'pull_request' && format('sentry_auth_token={0}', secrets.SENTRY_TOKEN) || '' }}
+    with:
+      images: ghcr.io/aam-digital/my-service
+      version: ${{ github.event.release.tag_name }}
+```
+
+A build that is told to use a secret but gets none fails on purpose (the Dockerfile mount is empty); the builds that
+should work without it (PRs) must not require it.
 
 ### Example: several registries, artifact from an earlier job
 
