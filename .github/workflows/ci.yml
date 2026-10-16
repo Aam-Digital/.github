@@ -1,4 +1,5 @@
-# CI of this repository: lints the shared workflows themselves.
+# CI of this repository: lints the shared workflows themselves and, on `main`, moves the major tag that consumers
+# reference (`@v1`) to the new commit. Every merge to `main` therefore reaches all repositories on their next run.
 name: CI
 
 on:
@@ -10,7 +11,47 @@ on:
 permissions:
   contents: read
 
+env:
+  # The major tag that follows `main`. For a breaking change (see README.md in .github/workflows), set this to the
+  # next major (`v2`) in the same PR: the old tag then stays where it is, and consumers switch one by one.
+  MAJOR_TAG: v1
+
 jobs:
-  # Check name: `actionlint / actionlint`
+  # Check name: `actionlint / actionlint` (required by the ruleset of `main`; do not rename)
   actionlint:
     uses: ./.github/workflows/actionlint.yml
+
+  move-major-tag:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: actionlint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # move the tag
+    # Pushes are handled in order, so that an older run never moves the tag back.
+    concurrency:
+      group: move-major-tag
+      cancel-in-progress: false
+    steps:
+      - name: Move ${{ env.MAJOR_TAG }} to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if current=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR_TAG" --jq .object.sha 2>/dev/null); then
+            status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$current...$GITHUB_SHA" --jq .status)
+            case "$status" in
+              identical)
+                echo "$MAJOR_TAG already points to $GITHUB_SHA"
+                exit 0
+                ;;
+              ahead) ;;
+              *)
+                echo "::warning::$GITHUB_SHA is not ahead of $MAJOR_TAG ($current, compare status '$status'), so the tag is not moved"
+                exit 0
+                ;;
+            esac
+            gh api --silent -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$MAJOR_TAG" -f sha="$GITHUB_SHA" -F force=true
+            echo "Moved $MAJOR_TAG from $current to $GITHUB_SHA"
+          else
+            gh api --silent -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$MAJOR_TAG" -f sha="$GITHUB_SHA"
+            echo "Created $MAJOR_TAG at $GITHUB_SHA"
+          fi
