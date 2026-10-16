@@ -461,7 +461,8 @@ Check name: `actionlint / actionlint`.
 Consumers reference the moving major tag `v1`. There are no per-change releases: after every push to `main`, this
 repository's CI (`ci.yml`, job `move-major-tag`) moves `v1` to the new commit once actionlint has passed. A merged PR
 (including a Renovate update of the actions used here) therefore reaches every repository on its next workflow run.
-Since `main` only changes through reviewed PRs (ruleset), the review is the release gate.
+Since `main` only changes through PRs (ruleset), merging a PR here is the release step: check what it changes for
+the consumers before merging.
 
 A consumer PR can test against a branch of this repository (`@<branch>`), but must switch to `@v1` before it is merged.
 
