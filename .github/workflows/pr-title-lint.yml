@@ -1,0 +1,25 @@
+# We squash-merge exclusively, with squash_merge_commit_title=PR_TITLE, so the
+# PR title becomes the commit subject on the default branch that @semantic-release/commit-analyzer
+# (or another conventional-commits release tool) reads to determine the next release version.
+# Enforce Conventional Commits here so an invalid/mistyped type doesn't silently produce a missing release.
+#
+# Callers trigger this on pull_request_target (not pull_request) so the check also runs on PRs from forks.
+# The action only reads the PR title from the event payload and never checks out
+# PR code, so running in the base-repo context is safe here.
+name: PR title lint
+
+on:
+  workflow_call:
+
+jobs:
+  # The job id and name are part of the check name (`<caller job> / Validate PR title`).
+  # Do not rename them within v1.
+  validate:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

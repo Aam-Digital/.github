@@ -1,0 +1,6 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Updates the actions used by the shared workflows in .github/workflows. After a merge, CI moves the v1 tag, so every repository runs the update on its next build.",
+  "extends": ["local>Aam-Digital/.github//renovate/default"],
+  "enabledManagers": ["github-actions"]
+}
