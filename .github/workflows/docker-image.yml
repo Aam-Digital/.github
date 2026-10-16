@@ -1,4 +1,4 @@
-# Builds a container image and (by default) pushes it, for PR, prerelease and release builds alike.
+# Builds a container image and (by default) pushes it, for PR, edge and release builds alike.
 # Callers only pass inputs; see README.md in this folder for examples and the resulting check names.
 #
 # Tags are always explicit (docker/metadata-action's automatic `latest` is turned off):

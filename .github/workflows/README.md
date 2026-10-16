@@ -5,9 +5,10 @@ Inputs, secrets and outputs are documented in the `workflow_call` section at the
 
 | Workflow | What it does | Typical trigger in the caller | Permissions of the calling job | Check name |
 | --- | --- | --- | --- | --- |
-| [`docker-image.yml`](docker-image.yml) | Builds and pushes a container image (PR, prerelease, release) | `pull_request`, `release: published` | `contents: read`, `packages: write` | `<job> / build`; with `native-runners`: `<job> / build-native (<platform>)`, `<job> / merge` |
-| [`release.yml`](release.yml) | Full release or `edge` prerelease with semantic-release | `push` to the default branch, `workflow_dispatch` | `contents: read` (+ PAT as secret `token`) | `<job> / release` |
-| [`image-prune.yml`](image-prune.yml) | Deletes old prerelease images (`*-edge.*`) after a full release | `release: published` | `packages: write` | `<job> / prune` |
+| [`docker-image.yml`](docker-image.yml) | Builds and pushes a container image (PR, edge, release) | `pull_request`, `push`, `release: published` | `contents: read`, `packages: write` | `<job> / build`; with `native-runners`: `<job> / build-native (<platform>)`, `<job> / merge` |
+| [`edge-version.yml`](edge-version.yml) | Computes the version of an edge build (`1.4.1-edge.5`) | `push` to the default branch | `contents: read` | `<job> / version` |
+| [`release.yml`](release.yml) | Creates the next full release with semantic-release | `push` to the default branch, or `workflow_dispatch` | `contents: read` (+ PAT as secret `token`) | `<job> / release` |
+| [`image-prune.yml`](image-prune.yml) | Deletes old edge images (`*-edge.*`) after a full release | `release: published` | `packages: write` | `<job> / prune` |
 | [`pr-image-cleanup.yml`](pr-image-cleanup.yml) | Deletes the `pr-<n>` image when a PR closes, then untagged images older than 2 days | `pull_request: closed` | `actions: write`, `packages: write` | `<job> / cleanup` |
 | [`pr-title-lint.yml`](pr-title-lint.yml) | Checks that PR titles follow Conventional Commits | `pull_request_target` | `pull-requests: read` | `<job> / Validate PR title` |
 | [`actionlint.yml`](actionlint.yml) | Lints the repository's workflows (with shellcheck) | `pull_request`, `push` | `contents: read` | `<job> / actionlint` |
@@ -50,23 +51,24 @@ Complete examples: [replication-backend](https://github.com/Aam-Digital/replicat
 
 ## Release model
 
-Versions come from Conventional Commit PR titles via [semantic-release](https://semantic-release.gitbook.io/). The
-plugins stay in each repository's own configuration (`.releaserc*`).
+Every push to the default branch builds an **edge** image; full releases come from Conventional Commit PR titles via
+[semantic-release](https://semantic-release.gitbook.io/) (plugins in each repository's own `.releaserc*`).
 
-- **auto**: every push to the default branch with a `fix`/`feat`/breaking change is released right away.
-- **manual**: pushes to the default branch create prereleases `<next version>-edge.<n>`. A full release is started by
-  hand (`workflow_dispatch`); it first deletes the old prereleases, and `image-prune.yml` then deletes their images.
+- **Edge build:** `edge-version.yml` computes `<last release, patch + 1>-edge.<commits since>`, e.g. `1.4.1-edge.5`.
+  There is no tag and no GitHub release for it. Move the `edge` tag only if `is-head` is `true`, and give the image job
+  a `concurrency` group with `cancel-in-progress: true`, so that an older run never moves `edge` back.
+- **Full release**, in one of two modes: **auto** (`release.yml` on every push; a `fix`/`feat`/breaking change is
+  released right away) or **manual** (`release.yml` via `workflow_dispatch`). Releases are created with a PAT, because
+  releases created with the `GITHUB_TOKEN` trigger no workflows. The `release: published` event builds the image, and
+  `image-prune.yml` then deletes the edge images of the finished cycle.
 
-Releases are created with a PAT, because releases created with the `GITHUB_TOKEN` trigger no workflows. The
-`release: published` event builds the image:
-
-| Release | Image tags |
+| Build | Image tags |
 | --- | --- |
-| prerelease `1.4.0-edge.3` | `1.4.0-edge.3`, `edge` |
-| full release `1.4.0` | `1.4.0`, `stable`, `latest` |
+| push to the default branch | `1.4.1-edge.5`, `edge` |
+| full release `1.4.1` | `1.4.1`, `stable`, `latest` |
 | pull request #123 | `pr-123` |
 
-Pass `stable: ${{ !github.event.release.prerelease }}`; never derive it from the version string.
+Pass `stable: ${{ !github.event.release.prerelease }}` for release images; never derive it from the version string.
 
 ## Versioning (`v1`)
 
