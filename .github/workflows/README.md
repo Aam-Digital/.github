@@ -1,127 +1,23 @@
 # Shared GitHub Actions workflows
 
-Reusable workflows for all Aam-Digital repositories, so that each repository keeps only what is specific to it
-(see Aam-Digital/internal#392).
+Reusable workflows for all Aam-Digital repositories, so that each repository keeps only what is specific to it.
+Inputs, secrets and outputs are documented in the `workflow_call` section at the top of each file.
 
-| Workflow                                       | Purpose                                                          | Check name(s) in the caller |
-| ---------------------------------------------- | ---------------------------------------------------------------- | --------------------------- |
-| [`docker-image.yml`](docker-image.yml)         | Build (and push) a container image for PRs, prereleases and releases | `<caller job> / build`, or with `native-runners`: `<caller job> / build-native (linux/amd64)`, `<caller job> / build-native (linux/arm64)`, `<caller job> / merge` |
-| [`release.yml`](release.yml)                   | Create the next release or `edge` prerelease with semantic-release | `<caller job> / release` |
-| [`image-prune.yml`](image-prune.yml)           | Delete old prerelease images (`*-edge.*`) after a full release   | `<caller job> / prune` |
-| [`pr-image-cleanup.yml`](pr-image-cleanup.yml) | Delete the `pr-<n>` image(s) from ghcr.io when a PR is closed, and old untagged images | `<caller job> / cleanup` |
-| [`pr-title-lint.yml`](pr-title-lint.yml)       | Enforce Conventional Commits in PR titles                        | `<caller job> / Validate PR title` |
-| [`actionlint.yml`](actionlint.yml)             | Lint the repository's own workflow files                         | `<caller job> / actionlint` |
+| Workflow | What it does | Typical trigger in the caller | Permissions of the calling job | Check name |
+| --- | --- | --- | --- | --- |
+| [`docker-image.yml`](docker-image.yml) | Builds and pushes a container image (PR, prerelease, release) | `pull_request`, `release: published` | `contents: read`, `packages: write` | `<job> / build`; with `native-runners`: `<job> / build-native (<platform>)`, `<job> / merge` |
+| [`release.yml`](release.yml) | Full release or `edge` prerelease with semantic-release | `push` to the default branch, `workflow_dispatch` | `contents: read` (+ PAT as secret `token`) | `<job> / release` |
+| [`image-prune.yml`](image-prune.yml) | Deletes old prerelease images (`*-edge.*`) after a full release | `release: published` | `packages: write` | `<job> / prune` |
+| [`pr-image-cleanup.yml`](pr-image-cleanup.yml) | Deletes the `pr-<n>` image when a PR closes, then untagged images older than 2 days | `pull_request: closed` | `actions: write`, `packages: write` | `<job> / cleanup` |
+| [`pr-title-lint.yml`](pr-title-lint.yml) | Checks that PR titles follow Conventional Commits | `pull_request_target` | `pull-requests: read` | `<job> / Validate PR title` |
+| [`actionlint.yml`](actionlint.yml) | Lints the repository's workflows (with shellcheck) | `pull_request`, `push` | `contents: read` | `<job> / actionlint` |
 
-`ci.yml` is this repository's own CI (actionlint on the workflows here, and moving `v1` after each merge, see
-"Versioning" below); it is not meant to be called.
+`ci.yml` is this repository's own CI; it is not meant to be called.
 
-## General rules
-
-- **Pin `@v1`**, never `@main` or a branch:
-  `uses: Aam-Digital/.github/.github/workflows/<file>@v1`.
-  This way a push to this repository (e.g. an edit of the org profile README) does not change CI everywhere.
-- **Permissions:** a called workflow cannot get more permissions than the calling job has.
-  The calling job (or the caller workflow's top-level `permissions`) must grant at least what is listed for each
-  workflow below, otherwise the run fails before it starts. Callers should set `permissions: {}` at the top level of
-  the workflow and grant the permissions per job (as in all examples below); without a top-level `permissions`,
-  checkov (`CKV2_GHA_1`, blocking in `qlty check`) flags the workflow. Jobs of the caller that are not shown in an
-  example (tests, ...) need their own `permissions`, e.g. `contents: read`.
-- **Secrets and `env`** of the caller are not passed through. Everything a workflow needs is an input or an explicitly
-  passed secret.
-- **Check names:** GitHub names the check of a job in a called workflow `<caller job> / <called job>`, where each part is
-  the job's `name` if it has one, else its id. The called job ids/names listed above are part of the `v1` contract.
-  If you move an existing job into one of these workflows, either keep the caller job's name so that the check name is
-  what the repository's ruleset expects, or update the required status checks in the same PR. Otherwise PRs wait
-  forever for a check that never reports. Jobs of the mode that is not used (e.g. `merge` and `build-native` without
-  `native-runners`) report as skipped (`<caller job> / build-native`, without the platform); a skipped required check
-  counts as passed.
-
-## Release model
-
-Every repository versions with [semantic-release](https://semantic-release.gitbook.io/) from Conventional Commit PR
-titles (squash merge, see `pr-title-lint.yml`). There are two modes:
-
-- **auto**: every push to the default branch that contains a `fix`/`feat`/breaking change is released right away
-  (`release.yml` with `type: release` on push).
-- **manual**: pushes to the default branch create **prereleases** `<next version>-edge.<n>`, e.g. `1.4.0-edge.3`
-  (`release.yml` with `type: prerelease` on push). As soon as there is any `fix`/`feat`/breaking change since the last
-  full release, *every* later push creates the next prerelease (and image), also a push with only `chore`/`docs`
-  commits; see `release.yml` below. A full release is created by running the release workflow by hand
-  (`workflow_dispatch`, `type: release`). It first deletes the `*-edge.*` prereleases and tags (and the `*-master.*` ones
-  of the old naming), then releases the next version. After the full release, `image-prune.yml` deletes the
-  prerelease images.
-
-Releases are created with a PAT (`GH_TOKEN`), because releases created with the `GITHUB_TOKEN` trigger no workflows.
-The `release: published` event then builds the image (`docker-image.yml`) with these tags:
-
-| GitHub release                     | Image tags                                  |
-| ---------------------------------- | ------------------------------------------- |
-| prerelease `1.4.0-edge.3`          | `1.4.0-edge.3`, `edge`                      |
-| full release `1.4.0`               | `1.4.0`, `stable`, `latest`                 |
-| pull request #123 (not a release)  | `pr-123`                                    |
-
-`stable`/`latest` come from the release's **prerelease flag** (`stable: ${{ !github.event.release.prerelease }}`),
-never from parsing the version string.
-
-## `docker-image.yml`
-
-One workflow for PR, prerelease (`edge`) and release images. It checks out the calling repository, optionally downloads
-an artifact and runs a preparation command, then builds with Buildx, using the GitHub Actions cache (one scope per
-image) and setting the OCI labels from `docker/metadata-action`.
-
-Two build modes:
-
-- **default** (job `build`): all platforms in one job; QEMU is set up if a non-amd64 platform is requested.
-- **`native-runners: true`**: one job per platform on a native GitHub-hosted runner (`linux/amd64` on `ubuntu-latest`,
-  `linux/arm64` on `ubuntu-24.04-arm`; no other platforms), each pushes its image by digest only. Then the job `merge`
-  creates the multi-platform image with all tags. Much faster than QEMU for arm64 builds that compile code.
-  Check names: `<caller job> / build-native (linux/amd64)`, `<caller job> / build-native (linux/arm64)`,
-  `<caller job> / merge`. With `push: false` only the per-platform builds run.
-
-**Replaced images:** this workflow deletes nothing. When a push moves a tag, the image the tag pointed to before stays in
-the package; if that was its last tag (e.g. the previous `pr-<n>` image, or the previous image of a branch tag like
-`main`), it is now untagged. With `native-runners`, the per-platform images pushed by digest are untagged as well.
-`pr-image-cleanup.yml` deletes such untagged images (older than 2 days) whenever a PR is closed. Moving `edge`,
-`latest` or `stable` leaves the previous image tagged with its version, so it is kept.
-
-Required permissions of the calling job: `contents: read`, `packages: write` (also with `push: false`).
-
-| Input           | Default                   | Description |
-| --------------- | ------------------------- | ----------- |
-| `images`        | (required)                | Image name(s) without tag, one per line or comma-separated. All get the same tags. Images on ghcr.io are pushed with the `GITHUB_TOKEN`; images on Docker Hub (`docker.io/…` or no registry host) need the `DOCKERHUB_*` secrets. |
-| `context`       | `.`                       | Build context |
-| `file`          | `<context>/Dockerfile`    | Dockerfile |
-| `version`       | –                         | Tags the image `<version>` and sets the `org.opencontainers.image.version` label (unless `labels` sets it) |
-| `stable`        | `false`                   | Also tag `stable` and `latest`. Requires `version`. Pass `${{ !github.event.release.prerelease }}`; never derive it from the version string. |
-| `tags`          | –                         | Extra tags, one per line or comma-separated, e.g. `edge`, `pr-123` |
-| `labels`        | –                         | Extra or overriding labels (`key=value`, one per line) |
-| `platforms`     | `linux/amd64,linux/arm64` | PR builds pass `linux/amd64` |
-| `native-runners` | `false`                  | Build each platform on a native runner and merge (see above). Only `linux/amd64` and `linux/arm64`. |
-| `build-args`    | –                         | `KEY=value`, one per line |
-| `push`          | `true`                    | `false` only checks that the image builds (e.g. PRs from forks) |
-| `cache-scope`   | last path segment of the first image | GitHub Actions cache scope. With `native-runners` it also names the digest artifacts, so it must differ between calls in the same workflow run (the default does for different images). |
-| `artifact-name` / `artifact-path` | – / `.` | Download a workflow artifact (e.g. a web app built in an earlier job) before building |
-| `prepare`       | –                         | Shell commands run in the checkout before building; `$VERSION` holds the `version` input |
-
-| Secret               | Description |
-| -------------------- | ----------- |
-| `DOCKERHUB_USERNAME` | Only for images on Docker Hub |
-| `DOCKERHUB_TOKEN`    | Only for images on Docker Hub |
-| `BUILD_SECRETS`      | Optional BuildKit secrets for the build: `id=value`, one per line (the format of build-push-action's `secrets` input). Used in the Dockerfile with `RUN --mount=type=secret,id=<id> ...`. Passed to the build in both modes (`build` and every `build-native` job). Every value is masked in the logs (not only when GitHub knows it as a secret) and never printed. Unset or empty: no secret is passed. |
-
-Outputs: `digest` (of the pushed image or multi-platform index), `tags` (all `<image>:<tag>` references, one per line).
-
-A PR image must carry only its `pr-<n>` tag (do not pass `version` for PR builds; set the version label via `labels` if
-needed). `pr-image-cleanup.yml` never deletes an image that carries another tag.
-
-### Example: PR image + release image
+## Calling a workflow
 
 ```yaml
-# .github/workflows/pr-release.yml
-on:
-  pull_request:
-
-permissions: {} # each job grants what it needs
+permissions: {} # nothing at the top level; each job grants what it needs
 
 jobs:
   build:
@@ -133,360 +29,68 @@ jobs:
       images: ghcr.io/aam-digital/my-service
       tags: pr-${{ github.event.number }}
       platforms: linux/amd64
-      # PRs from forks cannot push; only check that the image builds
-      push: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
 ```
 
-```yaml
-# .github/workflows/on-release.yml
-on:
-  release:
-    types: [published] # the release must be created with a PAT, GITHUB_TOKEN releases trigger no workflows
+- Always reference **`@v1`**, never a branch.
+- The calling job must grant the **permissions** from the table. A called workflow cannot get more, and the run fails
+  before it starts. `permissions: {}` at the top level keeps `qlty check` (checkov) happy.
+- The caller's **secrets and `env` are not passed on**: pass secrets explicitly under `secrets:`, everything else as
+  inputs.
+- **Check names** become `<caller job> / <called job>`. Moving an existing job into a shared workflow renames its
+  check, so update the required checks of the ruleset when that PR merges. Skipped jobs (e.g. `build-native` and
+  `merge` when `native-runners` is off) count as passed.
+- `pr-title-lint.yml` only works with squash-only merging and the PR title as commit title. Call it on
+  `pull_request_target` with the comment `# zizmor: ignore[dangerous-triggers]` on that line, otherwise `qlty check`
+  fails.
+- PR images carry only their `pr-<n>` tag (otherwise the cleanup keeps them). PRs from forks build with `push: false`.
 
-permissions: {} # each job grants what it needs
+Complete examples: [replication-backend](https://github.com/Aam-Digital/replication-backend/tree/master/.github/workflows)
+(auto release mode, PR images) and [ndb-core](https://github.com/Aam-Digital/ndb-core/tree/master/.github/workflows)
+(manual release mode, two registries, web app built in an earlier job and passed as an artifact).
 
-jobs:
-  build:
-    uses: Aam-Digital/.github/.github/workflows/docker-image.yml@v1
-    permissions:
-      contents: read
-      packages: write
-    with:
-      images: ghcr.io/aam-digital/my-service
-      version: ${{ github.event.release.tag_name }}
-      # full release: <version>, stable, latest; prerelease (X.Y.Z-edge.N): <version>, edge
-      stable: ${{ !github.event.release.prerelease }}
-      tags: ${{ github.event.release.prerelease && 'edge' || '' }}
-      # native-runners: true # arm64 on its own runner instead of QEMU
+## Release model
 
-  prune-prerelease-images:
-    # manual release mode: after a full release, the edge images are no longer needed
-    if: ${{ !github.event.release.prerelease }}
-    needs: build
-    uses: Aam-Digital/.github/.github/workflows/image-prune.yml@v1
-    permissions:
-      packages: write
-```
+Versions come from Conventional Commit PR titles via [semantic-release](https://semantic-release.gitbook.io/). The
+plugins stay in each repository's own configuration (`.releaserc*`).
 
-### Example: build secrets (e.g. uploading Sentry source bundles from inside the Dockerfile)
+- **auto**: every push to the default branch with a `fix`/`feat`/breaking change is released right away.
+- **manual**: pushes to the default branch create prereleases `<next version>-edge.<n>`. A full release is started by
+  hand (`workflow_dispatch`); it first deletes the old prereleases, and `image-prune.yml` then deletes their images.
 
-```yaml
-# Dockerfile: RUN --mount=type=secret,id=sentry_auth_token SENTRY_AUTH_TOKEN="$(cat /run/secrets/sentry_auth_token)" ...
-jobs:
-  build:
-    uses: Aam-Digital/.github/.github/workflows/docker-image.yml@v1
-    permissions:
-      contents: read
-      packages: write
-    secrets:
-      # not for PR builds: forks cannot read the secret, and PR images are never deployed
-      BUILD_SECRETS: ${{ github.event_name != 'pull_request' && format('sentry_auth_token={0}', secrets.SENTRY_TOKEN) || '' }}
-    with:
-      images: ghcr.io/aam-digital/my-service
-      version: ${{ github.event.release.tag_name }}
-```
+Releases are created with a PAT, because releases created with the `GITHUB_TOKEN` trigger no workflows. The
+`release: published` event builds the image:
 
-A build that is told to use a secret but gets none fails on purpose (the Dockerfile mount is empty); the builds that
-should work without it (PRs) must not require it.
+| Release | Image tags |
+| --- | --- |
+| prerelease `1.4.0-edge.3` | `1.4.0-edge.3`, `edge` |
+| full release `1.4.0` | `1.4.0`, `stable`, `latest` |
+| pull request #123 | `pr-123` |
 
-### Example: several registries, artifact from an earlier job
+Pass `stable: ${{ !github.event.release.prerelease }}`; never derive it from the version string.
 
-```yaml
-permissions: {} # each job grants what it needs
+## Versioning (`v1`)
 
-jobs:
-  build-webapp:
-    # ... uploads the artifact "webapp-files"
-  build:
-    needs: build-webapp
-    uses: Aam-Digital/.github/.github/workflows/docker-image.yml@v1
-    permissions:
-      contents: read
-      packages: write
-    secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKER_PASSWORD }}
-    with:
-      images: |
-        aamdigital/ndb-server
-        ghcr.io/aam-digital/ndb-core
-      file: build/Dockerfile
-      artifact-name: webapp-files
-      artifact-path: dist
-      version: ${{ github.event.release.tag_name }}
-      stable: ${{ !github.event.release.prerelease }}
-```
+There are no releases of this repository. After every push to `main`, CI moves `v1` to the new commit once actionlint
+has passed, so a merged PR (Renovate's included) reaches every repository on its next run. Merging here is the release
+step: check what a change does to the callers before merging.
 
-(The image cleanup workflows only cover ghcr.io; Docker Hub tags are left as they are.)
-
-## `release.yml`
-
-Creates the next release or prerelease with semantic-release
-([`cycjimmy/semantic-release-action`](https://github.com/cycjimmy/semantic-release-action)). Only the semantic-release
-`branches` setting comes from this workflow (the caller's default branch); the plugins and everything else stay in the
-repository's own configuration (`.releaserc*`, `release.config.*` or `release` in package.json), including `tagFormat`
-(which must end with the version). Releases are only created from the default branch: on any other ref the job is
-**skipped** by the workflow itself (no gate needed in the caller; the outputs are empty then). Skipping, rather than
-a no-op run, matters: GitHub keeps only one *pending* run per concurrency group, so a no-op run of a push to another
-branch could otherwise replace a release that is waiting. The concurrency group is per repository, ref and type.
-
-- `type: release`: a full release of the default branch (`branches: [{name: <default>, prerelease: false}]`).
-  With `cleanup-prereleases` (default), the GitHub prereleases and git tags matching `*-<prerelease-id>.*` or
-  `*-master.*` are deleted first.
-- `type: prerelease`: `<next version>-<prerelease-id>.<n>`, e.g. `1.4.0-edge.3`. semantic-release cannot configure the
-  default branch alone as a prerelease branch (it requires an existing release branch next to it), so a **dry run**
-  with the default branch as release branch computes the next version and release notes, and this workflow creates
-  the tag and the GitHub prerelease (with the PAT, so that `release: published` builds the image). `<n>` continues
-  after the highest existing `<next version>-<prerelease-id>.*` tag. If the commit already has such a prerelease tag
-  (e.g. a re-run), nothing is created. Unlike semantic-release's own prerelease branches, which only release when
-  there are releasable commits since the last *prerelease*, this compares with the last *full* release: once there is
-  a releasable change, every push to the default branch creates a new prerelease. The repository's `prepare`/`publish`/`success` plugins run only for full
-  releases, so prereleases do not comment on issues or PRs.
-
-Required permissions of the calling job: `contents: read`. Everything that writes uses the `token` secret
-(PAT with `repo` scope, or a fine-grained token with contents (and, if the plugins comment, issues and pull requests)
-write access). Releases of one repository and type are serialised (concurrency group, never cancelled).
-
-| Input                 | Default  | Description |
-| --------------------- | -------- | ----------- |
-| `type`                | (required) | `release` or `prerelease` |
-| `prerelease-id`       | `edge`   | Prerelease identifier |
-| `cleanup-prereleases` | `true`   | Only for `type: release`: delete the `*-<prerelease-id>.*` and `*-master.*` prereleases and tags first |
-| `extra-plugins`       | –        | Plugins to install that the configuration uses, one per line (e.g. `@semantic-release/git`, `semantic-release-replace-plugin@1.2.6`) |
-| `node-version-file`   | `.nvmrc` | Node.js version for semantic-release; if the file does not exist, the latest LTS. If package.json has `"packageManager": "npm@x.y.z"`, that npm is installed. |
-
-| Secret          | Description |
-| --------------- | ----------- |
-| `token`         | (required) PAT for tags, releases (and comments). Not the `GITHUB_TOKEN`. |
-| `slack-webhook` | Optional, available to plugins as `SLACK_WEBHOOK` (e.g. `semantic-release-slack-bot`) |
-
-Outputs: `version` (the released version, empty if none), `published` (`true`/`false`; empty if the job was skipped on a non-default branch).
-
-### Example: manual release mode
-
-```yaml
-# .github/workflows/on-push.yml (part)
-on:
-  push:
-    branches: [main]
-
-permissions: {} # each job grants what it needs
-
-jobs:
-  # ... tests
-  prerelease:
-    needs: [test]
-    uses: Aam-Digital/.github/.github/workflows/release.yml@v1
-    permissions:
-      contents: read
-    with:
-      type: prerelease
-    secrets:
-      token: ${{ secrets.GH_TOKEN }}
-```
-
-```yaml
-# .github/workflows/release.yml
-on:
-  workflow_dispatch:
-
-permissions: {} # each job grants what it needs
-
-jobs:
-  release:
-    uses: Aam-Digital/.github/.github/workflows/release.yml@v1
-    permissions:
-      contents: read
-    with:
-      type: release
-      extra-plugins: |
-        semantic-release-slack-bot
-    secrets:
-      token: ${{ secrets.GH_TOKEN }}
-      slack-webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-```
-
-### Example: auto release mode
-
-```yaml
-on:
-  push:
-    branches: [main]
-
-permissions: {} # each job grants what it needs
-
-jobs:
-  # ... tests
-  release:
-    needs: [test]
-    uses: Aam-Digital/.github/.github/workflows/release.yml@v1
-    permissions:
-      contents: read
-    with:
-      type: release
-    secrets:
-      token: ${{ secrets.GH_TOKEN }}
-```
-
-## `image-prune.yml`
-
-Deletes old prerelease images from ghcr.io, typically after a full release (see the release example under
-`docker-image.yml`), using [`dataaxiom/ghcr-cleanup-action`](https://github.com/dataaxiom/ghcr-cleanup-action) with
-wildcard tags. Like `pr-image-cleanup.yml` it is manifest-aware (children of a deleted image are deleted unless another
-image uses them). An image that carries one of the `exclude-tags`, e.g. the image `edge` currently points to, is
-neither deleted nor untagged, even if another of its tags matches. A version whose tags all match but are several
-(e.g. `1.4.0-edge.3` and `1.4.0-master.2`) is only untagged by the action. Untagged versions are never touched.
-
-Required permissions of the calling job: `packages: write` (same token rules as `pr-image-cleanup.yml`).
-
-| Input          | Default                      | Description |
-| -------------- | ---------------------------- | ----------- |
-| `packages`     | repository name              | ghcr.io package name(s), comma-separated |
-| `tag-patterns` | `*-edge.*,*-master.*`        | Tags to delete, comma-separated, `*` wildcards. Every pattern must contain a letter or digit. |
-| `exclude-tags` | `edge,master,stable,latest`  | Images with one of these tags (wildcards allowed) are never deleted or untagged |
-| `dry-run`      | `false`                      | Only log what would be deleted |
-
-Secret `token`: optional, as in `pr-image-cleanup.yml`. Docker Hub images are not covered.
-
-## `pr-image-cleanup.yml`
-
-Deletes the image(s) tagged `pr-<n>` when the PR is closed, using
-[`dataaxiom/ghcr-cleanup-action`](https://github.com/dataaxiom/ghcr-cleanup-action). It reads all package versions
-(not just the first page) and is manifest-aware: deleting a multi-platform index also deletes its per-platform and
-attestation manifests, unless another image still uses them; a version that also carries another tag is only untagged.
-Afterwards it deletes the **untagged images** of the package(s) that are older than `untagged-older-than` (default
-`2 days`): mainly the images of earlier pushes to PRs, whose `pr-<n>` tag moved on to a newer push, the previous images
-of moving branch tags such as `main`, and the per-platform pushes of `native-runners` builds. Children of tagged images
-are never deleted, and the age limit keeps the intermediate images of builds that are still running. This step is best
-effort: a failure only shows as a failed step, and the next closed PR catches what it left.
-
-Most leaked PR images are not failed deletes but a race: the build of the PR's last push is still running when
-the PR is merged, and pushes `pr-<n>` only after the cleanup ran. Pass the PR build workflow file(s) as
-`build-workflows`: their unfinished runs on the PR's head branch are then cancelled, and the cleanup waits (up to
-15 minutes) until they have stopped before deleting.
-
-Required permissions of the calling job: `actions: write` (cancel PR builds), `packages: write`.
-The default `GITHUB_TOKEN` can delete versions of packages linked to the repository (Admin role in the package's
-"Manage Actions access" settings). Otherwise pass a classic PAT
-(`read:packages`, `delete:packages`) as the `token` secret.
-
-| Input             | Default                            | Description |
-| ----------------- | ---------------------------------- | ----------- |
-| `packages`        | repository name                    | ghcr.io package name(s), comma-separated |
-| `tags`            | `pr-<number>` of the triggering PR | Exact tag(s), comma-separated (no wildcards) |
-| `build-workflows` | –                                  | PR build workflow file name(s), comma-separated, to cancel and wait for first |
-| `untagged-older-than` | `2 days`                       | Also delete untagged images older than this (format of ghcr-cleanup-action's `older-than`); empty: keep them |
-| `dry-run`         | `false`                            | Only log what would be deleted |
-
-Note: the first run in a package with a large backlog of untagged versions can take hours and use up the
-`GITHUB_TOKEN`'s API rate limit. Clean up such a backlog once by hand before adopting this workflow.
-
-```yaml
-# .github/workflows/pr-closed.yml
-on:
-  pull_request:
-    types: [closed]
-
-permissions: {} # each job grants what it needs
-
-jobs:
-  cleanup-image:
-    # PRs from forks have no image (and their token cannot delete packages)
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    uses: Aam-Digital/.github/.github/workflows/pr-image-cleanup.yml@v1
-    permissions:
-      actions: write
-      packages: write
-    with:
-      build-workflows: pr-release.yml
-    #   packages: aam-services,keycloak-third-party-authentication
-    # secrets:
-    #   token: ${{ secrets.GH_TOKEN }} # only if the repository is not linked to the package
-```
-
-## `pr-title-lint.yml`
-
-Checks that the PR title follows [Conventional Commits](https://www.conventionalcommits.org/), using
-`amannn/action-semantic-pull-request`. This only guarantees conventional commits on the default branch if the
-repository allows squash merging only, with "Default commit message" = "Pull request title"
-(`squash_merge_commit_title = PR_TITLE`).
-
-Required permissions of the calling job: `pull-requests: read`.
-
-```yaml
-# .github/workflows/pr-title-lint.yml
-on:
-  # pull_request_target so that it also runs for PRs from forks. Safe here: the workflow never checks out PR code
-  # and only reads the PR title from the event payload. The zizmor comment keeps `qlty check` (dangerous-triggers,
-  # blocking with qlty's cloud defaults) from failing on this line.
-  pull_request_target: # zizmor: ignore[dangerous-triggers] never checks out PR code, only reads the PR title from the event payload
-    types: [opened, edited, synchronize, reopened]
-
-permissions: {} # each job grants what it needs
-
-jobs:
-  pr-title:
-    uses: Aam-Digital/.github/.github/workflows/pr-title-lint.yml@v1
-    permissions:
-      pull-requests: read
-```
-
-Check name: `pr-title / Validate PR title`.
-
-## `actionlint.yml`
-
-Runs [actionlint](https://github.com/rhysd/actionlint) (with shellcheck) on the calling repository's workflows.
-
-Required permissions of the calling job: `contents: read`.
-
-```yaml
-on:
-  pull_request:
-  push:
-    branches: [main]
-
-permissions: {} # each job grants what it needs
-
-jobs:
-  actionlint:
-    uses: Aam-Digital/.github/.github/workflows/actionlint.yml@v1
-    permissions:
-      contents: read
-```
-
-Check name: `actionlint / actionlint`.
-
-## Versioning: how `v1` is moved and when `v2` is cut
-
-Consumers reference the moving major tag `v1`. There are no per-change releases: after every push to `main`, this
-repository's CI (`ci.yml`, job `move-major-tag`) moves `v1` to the new commit once actionlint has passed. A merged PR
-(including a Renovate update of the actions used here) therefore reaches every repository on its next workflow run.
-Since `main` only changes through PRs (ruleset), merging a PR here is the release step: check what it changes for
-the consumers before merging.
-
-A consumer PR can test against a branch of this repository (`@<branch>`), but must switch to `@v1` before it is merged.
-
-To point `v1` back to an earlier commit (e.g. after a bad merge), revert the change in a PR; or, in an emergency:
-
-```shell
-gh api -X PATCH repos/Aam-Digital/.github/git/refs/tags/v1 -f sha=<good commit> -F force=true
-```
-
-Changes that are compatible with all existing callers may go into `v1`: bug fixes, new optional inputs/outputs,
-new workflows, action updates. Everything else needs a new major tag (`v2`): set `MAJOR_TAG: v2` in `ci.yml` in the same PR. `v1` then stays
-where it is, and the consumers are switched one by one:
+A change that breaks callers needs `v2`: set `MAJOR_TAG: v2` in `ci.yml` in the same PR, so that `v1` stays where it
+is, then switch the callers one by one. Breaking means:
 
 - removing or renaming an input, output or secret, or changing an input's default or meaning;
-- renaming a job id or job `name` (this changes check names, see above);
+- renaming a job id or job `name` (this changes check names);
 - requiring more permissions from the caller;
 - changing which image tags are produced for the same inputs.
 
-Rules for the workflows in this folder:
+To test a change before merging, point a caller PR at the branch (`@<branch>`), and switch back to `@v1` before
+merging it. In an emergency, `v1` can be reset by hand:
+`gh api -X PATCH repos/Aam-Digital/.github/git/refs/tags/v1 -f sha=<good commit> -F force=true`.
 
-- Keep shell inline. Do not fetch or run scripts from this repository at runtime.
-- Use fully qualified `uses:` references (`owner/repo/...@ref`) in callers. A local `./` reference is ambiguous once the
-  workflow is called from another repository (for a step's action it points into the caller's checkout).
-- Steps that several jobs of one workflow share are written once and reused with YAML anchors (`&name` / `*name`).
-- Actions of large trusted providers (`actions/*`, `docker/*`, `github/*`, …) use their plain major tag.
-  Other actions are pinned to a commit SHA with a `# vX.Y.Z` comment.
+## Rules for the workflows here
+
+- Keep shell inline; never fetch scripts from this repository at runtime.
 - Pass inputs to `run:` scripts via `env:`, never by `${{ }}` interpolation into the script.
+- Actions of large trusted providers (`actions/*`, `docker/*`, `github/*`, …) use their major tag; other actions are
+  pinned to a commit SHA with a `# vX.Y.Z` comment. Renovate (`renovate.json` in the repository root) updates both.
+- Steps shared between jobs of one workflow are written once and reused with YAML anchors (`&name` / `*name`).
+- Explain *why* in comments in the workflow file, next to the code; keep this README to what callers need.

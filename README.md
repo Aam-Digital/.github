@@ -5,7 +5,7 @@ Shared configuration for the repositories of the Aam-Digital organisation.
 
 | Folder / file | What |
 | --- | --- |
-| [`.github/workflows/`](.github/workflows) | Reusable GitHub Actions workflows (container images, releases, image cleanup, PR title and workflow linting). See its [README](.github/workflows/README.md) for inputs, permissions, check names, the release model and how the `v1` tag is moved. Callers set top-level `permissions: {}` and grant permissions per job. |
+| [`.github/workflows/`](.github/workflows) | Reusable GitHub Actions workflows (container images, releases, image cleanup, PR title and workflow linting). See its [README](.github/workflows/README.md) for how to call them, the release model and how `v1` is moved. |
 | [`renovate/`](renovate) | Shared Renovate presets (below) |
 | [`renovate.json`](renovate.json) | Renovate config of this repository: keeps the actions used by the shared workflows up to date. After a merge, CI moves `v1`, so the updates reach every repository without a release step. |
 | [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE), [`SECURITY.md`](SECURITY.md), [`CONTRIBUTING.md`](CONTRIBUTING.md) | Organisation-wide defaults (below) |
@@ -59,16 +59,3 @@ A repository keeps only what is specific to it in its own `renovate.json` and ex
 - **Object options** such as `vulnerabilityAlerts`, `lockFileMaintenance` and `constraints` are merged key by key: the repo only needs to set the keys it changes. Setting `vulnerabilityAlerts.labels` therefore replaces only those labels.
 - To add reviewers without repeating the preset's, use `additionalReviewers` (it is added to `reviewers`).
 - **`labels` in a package rule beat the top-level `labels`.** To put an extra label on some PRs, use `addLabels` in the rule. It adds to whatever labels apply instead of replacing them. For the same reason, the presets set no `labels` inside package rules.
-
-### Repo-specific notes
-
-- **ndb-core** relies on the `Final Review` label: `label-triggered-review.yml` fires on it, so dependency PRs get an Argos visual review. Set it in **both** places, otherwise the shared `dependencies` label silently turns this off for one kind of PR:
-
-  ```json
-  {
-    "labels": ["Final Review"],
-    "vulnerabilityAlerts": { "labels": ["Final Review"] }
-  }
-  ```
-
-- A repo with a different review rhythm (e.g. infrastructure) overrides `timezone` and `schedule`, and `lockFileMaintenance.schedule` if needed.
