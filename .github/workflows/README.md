@@ -5,14 +5,15 @@ Reusable workflows for all Aam-Digital repositories, so that each repository kee
 
 | Workflow                                       | Purpose                                                          | Check name(s) in the caller |
 | ---------------------------------------------- | ---------------------------------------------------------------- | --------------------------- |
-| [`docker-image.yml`](docker-image.yml)         | Build (and push) a container image for PRs, prereleases and releases; delete the image it replaces | `<caller job> / build`, or with `native-runners`: `<caller job> / build-native (linux/amd64)`, `<caller job> / build-native (linux/arm64)`, `<caller job> / merge` |
+| [`docker-image.yml`](docker-image.yml)         | Build (and push) a container image for PRs, prereleases and releases | `<caller job> / build`, or with `native-runners`: `<caller job> / build-native (linux/amd64)`, `<caller job> / build-native (linux/arm64)`, `<caller job> / merge` |
 | [`release.yml`](release.yml)                   | Create the next release or `edge` prerelease with semantic-release | `<caller job> / release` |
 | [`image-prune.yml`](image-prune.yml)           | Delete old prerelease images (`*-edge.*`) after a full release   | `<caller job> / prune` |
-| [`pr-image-cleanup.yml`](pr-image-cleanup.yml) | Delete the `pr-<n>` image(s) from ghcr.io when a PR is closed    | `<caller job> / cleanup` |
+| [`pr-image-cleanup.yml`](pr-image-cleanup.yml) | Delete the `pr-<n>` image(s) from ghcr.io when a PR is closed, and old untagged images | `<caller job> / cleanup` |
 | [`pr-title-lint.yml`](pr-title-lint.yml)       | Enforce Conventional Commits in PR titles                        | `<caller job> / Validate PR title` |
 | [`actionlint.yml`](actionlint.yml)             | Lint the repository's own workflow files                         | `<caller job> / actionlint` |
 
-`ci.yml` is this repository's own CI (actionlint on the workflows here); it is not meant to be called.
+`ci.yml` is this repository's own CI (actionlint on the workflows here, and moving `v1` after each merge, see
+"Versioning" below); it is not meant to be called.
 
 ## General rules
 
@@ -77,21 +78,13 @@ Two build modes:
   Check names: `<caller job> / build-native (linux/amd64)`, `<caller job> / build-native (linux/arm64)`,
   `<caller job> / merge`. With `push: false` only the per-platform builds run.
 
-**Replaced images are deleted right away** (`cleanup-replaced`, default `true`, ghcr.io images only): before pushing,
-the workflow records the digest each tag points to; after pushing, every such image that is not the new one and has
-**no tag left** is deleted, together with its platform and attestation manifests unless the new image or another tagged
-image still references them (with reproducible builds a platform manifest can be the same between builds). So the
-previous `pr-<n>` image disappears as soon as a new push to the PR replaces it, while moving `edge`, `latest` or
-`stable` deletes nothing as long as every build also passes `version`: the previous image keeps its version tag.
-An image that carries **only** moving tags (e.g. a branch build tagged just `main`) is deleted when the next push
-moves its last tag; pass `version` or set `cleanup-replaced: false` if such images must be kept. With `native-runners`, the per-platform
-images pushed by digest are deleted after merging as well (their manifests are part of the new image). Every deletion
-is logged in the step "Delete replaced images"; a failure there only produces a warning, never a failed build.
+**Replaced images:** this workflow deletes nothing. When a push moves a tag, the image the tag pointed to before stays in
+the package; if that was its last tag (e.g. the previous `pr-<n>` image, or the previous image of a branch tag like
+`main`), it is now untagged. With `native-runners`, the per-platform images pushed by digest are untagged as well.
+`pr-image-cleanup.yml` deletes such untagged images (older than 2 days) whenever a PR is closed. Moving `edge`,
+`latest` or `stable` leaves the previous image tagged with its version, so it is kept.
 
 Required permissions of the calling job: `contents: read`, `packages: write` (also with `push: false`).
-`cleanup-replaced` uses the same `GITHUB_TOKEN`, which can delete versions of packages linked to the repository
-(Admin role in the package's "Manage Actions access" settings, which is the default for a package that the
-repository's workflow pushed first). Without that access it only warns.
 
 | Input           | Default                   | Description |
 | --------------- | ------------------------- | ----------- |
@@ -104,7 +97,6 @@ repository's workflow pushed first). Without that access it only warns.
 | `labels`        | –                         | Extra or overriding labels (`key=value`, one per line) |
 | `platforms`     | `linux/amd64,linux/arm64` | PR builds pass `linux/amd64` |
 | `native-runners` | `false`                  | Build each platform on a native runner and merge (see above). Only `linux/amd64` and `linux/arm64`. |
-| `cleanup-replaced` | `true`                 | Delete the ghcr.io images this push replaced (see above) |
 | `build-args`    | –                         | `KEY=value`, one per line |
 | `push`          | `true`                    | `false` only checks that the image builds (e.g. PRs from forks) |
 | `cache-scope`   | last path segment of the first image | GitHub Actions cache scope. With `native-runners` it also names the digest artifacts, so it must differ between calls in the same workflow run (the default does for different images). |
@@ -225,7 +217,7 @@ jobs:
       stable: ${{ !github.event.release.prerelease }}
 ```
 
-(`cleanup-replaced` only covers the ghcr.io image; Docker Hub tags are left as they are.)
+(The image cleanup workflows only cover ghcr.io; Docker Hub tags are left as they are.)
 
 ## `release.yml`
 
@@ -362,7 +354,11 @@ Deletes the image(s) tagged `pr-<n>` when the PR is closed, using
 [`dataaxiom/ghcr-cleanup-action`](https://github.com/dataaxiom/ghcr-cleanup-action). It reads all package versions
 (not just the first page) and is manifest-aware: deleting a multi-platform index also deletes its per-platform and
 attestation manifests, unless another image still uses them; a version that also carries another tag is only untagged.
-Untagged versions that are not children of the deleted image are never touched.
+Afterwards it deletes the **untagged images** of the package(s) that are older than `untagged-older-than` (default
+`2 days`): mainly the images of earlier pushes to PRs, whose `pr-<n>` tag moved on to a newer push, the previous images
+of moving branch tags such as `main`, and the per-platform pushes of `native-runners` builds. Children of tagged images
+are never deleted, and the age limit keeps the intermediate images of builds that are still running. This step is best
+effort: a failure only shows as a failed step, and the next closed PR catches what it left.
 
 Most leaked PR images are not failed deletes but a race: the build of the PR's last push is still running when
 the PR is merged, and pushes `pr-<n>` only after the cleanup ran. Pass the PR build workflow file(s) as
@@ -379,10 +375,11 @@ The default `GITHUB_TOKEN` can delete versions of packages linked to the reposit
 | `packages`        | repository name                    | ghcr.io package name(s), comma-separated |
 | `tags`            | `pr-<number>` of the triggering PR | Exact tag(s), comma-separated (no wildcards) |
 | `build-workflows` | –                                  | PR build workflow file name(s), comma-separated, to cancel and wait for first |
+| `untagged-older-than` | `2 days`                       | Also delete untagged images older than this (format of ghcr-cleanup-action's `older-than`); empty: keep them |
 | `dry-run`         | `false`                            | Only log what would be deleted |
 
-Note: this deletes the image that is tagged `pr-<n>` when the PR closes. The images of earlier pushes to the PR are
-deleted by `docker-image.yml` (`cleanup-replaced`) as soon as they are replaced.
+Note: the first run in a package with a large backlog of untagged versions can take hours and use up the
+`GITHUB_TOKEN`'s API rate limit. Clean up such a backlog once by hand before adopting this workflow.
 
 ```yaml
 # .github/workflows/pr-closed.yml
@@ -461,24 +458,22 @@ Check name: `actionlint / actionlint`.
 
 ## Versioning: how `v1` is moved and when `v2` is cut
 
-Consumers reference a moving major tag (`v1`). Each change merged to `main` that should reach the consumers is released
-like this (`gh` logged in with push access to this repository):
+Consumers reference the moving major tag `v1`. There are no per-change releases: after every push to `main`, this
+repository's CI (`ci.yml`, job `move-major-tag`) moves `v1` to the new commit once actionlint has passed. A merged PR
+(including a Renovate update of the actions used here) therefore reaches every repository on its next workflow run.
+Since `main` only changes through reviewed PRs (ruleset), the review is the release gate.
+
+A consumer PR can test against a branch of this repository (`@<branch>`), but must switch to `@v1` before it is merged.
+
+To point `v1` back to an earlier commit (e.g. after a bad merge), revert the change in a PR; or, in an emergency:
 
 ```shell
-sha=$(gh api repos/Aam-Digital/.github/commits/main --jq .sha)
-# first release: immutable v1.0.0 plus the moving v1 tag
-gh release create v1.0.0 -R Aam-Digital/.github --target "$sha" --title v1.0.0 --generate-notes
-gh api -X POST repos/Aam-Digital/.github/git/refs -f ref=refs/tags/v1 -f sha="$sha"
-# every later release: the next v1.x.y, then move v1 to it
-gh release create v1.1.0 -R Aam-Digital/.github --target "$sha" --title v1.1.0 --generate-notes
-gh api -X PATCH repos/Aam-Digital/.github/git/refs/tags/v1 -f sha="$sha" -F force=true
+gh api -X PATCH repos/Aam-Digital/.github/git/refs/tags/v1 -f sha=<good commit> -F force=true
 ```
 
-Use a minor version for new inputs or workflows, a patch version for fixes. Until `v1` exists, a consumer PR can test
-against a branch of this repository (`@<branch>`), but must switch to `@v1` before it is merged.
-
 Changes that are compatible with all existing callers may go into `v1`: bug fixes, new optional inputs/outputs,
-new workflows, action updates. Everything else needs a new major tag (`v2`), and the consumers are switched one by one:
+new workflows, action updates. Everything else needs a new major tag (`v2`): set `MAJOR_TAG: v2` in `ci.yml` in the same PR. `v1` then stays
+where it is, and the consumers are switched one by one:
 
 - removing or renaming an input, output or secret, or changing an input's default or meaning;
 - renaming a job id or job `name` (this changes check names, see above);

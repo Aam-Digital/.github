@@ -9,6 +9,9 @@
 # Most leaked PR images are a race, not a failed delete: the build of the PR's last push is still running when
 # the PR is merged, so it pushes `pr-<n>` after the cleanup ran. With `build-workflows`, unfinished runs of the PR
 # build workflow(s) on the PR's head branch are cancelled, and the cleanup waits until they have stopped.
+#
+# Then it deletes the untagged images of the package(s) older than `untagged-older-than`: the images that later pushes
+# replaced (their tag moved on), here as well as in other PRs and moving tags. docker-image.yml deletes nothing itself.
 name: PR image cleanup
 
 on:
@@ -34,6 +37,13 @@ on:
           Workflow file name(s) of the PR image build, comma-separated (e.g. `pr-release.yml`). Their unfinished runs
           on the PR's head branch are cancelled, and awaited, before deleting, so that they cannot push the image again
           afterwards. Requires `actions: write`.
+      untagged-older-than:
+        type: string
+        required: false
+        default: 2 days
+        description: >-
+          Afterwards, also delete the untagged images of the package(s) older than this (e.g. images replaced by later
+          pushes). Format as in ghcr-cleanup-action's `older-than` (e.g. `2 days`). Empty: keep untagged images.
       dry-run:
         type: boolean
         required: false
@@ -140,4 +150,21 @@ jobs:
           packages: ${{ steps.config.outputs.packages }}
           delete-tags: ${{ steps.config.outputs.tags }}
           delete-untagged: false
+          dry-run: ${{ inputs.dry-run }}
+
+      # Images whose last tag moved to a newer push (earlier pushes to PRs, a moving branch tag such as `main`, the
+      # per-platform pushes of native-runner builds) stay in the package untagged until here. Children of tagged
+      # images are never deleted. Only images older than `untagged-older-than` are touched, so that builds in progress
+      # keep their intermediate images. Best effort: cleanups of two PRs closed at the same time may race for the
+      # same version.
+      - name: Delete untagged images
+        if: ${{ !cancelled() && steps.config.outcome == 'success' && inputs.untagged-older-than != '' }}
+        continue-on-error: true
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.token || github.token }}
+          owner: ${{ github.repository_owner }}
+          packages: ${{ steps.config.outputs.packages }}
+          delete-untagged: true
+          older-than: ${{ inputs.untagged-older-than }}
           dry-run: ${{ inputs.dry-run }}
