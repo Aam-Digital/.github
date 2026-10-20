@@ -6,7 +6,7 @@ A repository keeps only what is specific to it in its own `renovate.json` and ex
 | Preset | What it does |
 | --- | --- |
 | [`renovate/default`](default.json) | Base for every repo: `config:recommended`, all minor/patch updates in one `weekly-non-major-updates` group, Sundays (UTC), no dependency dashboard, max. 5 open PRs / 2 per hour, vulnerability and OSV alerts (any time, labelled `security`), label `dependencies`, reviewer, major updates as draft PRs. All GitHub Actions and reusable workflow updates (majors included) in one ready `github-actions` PR. Updates to this repo's own reusable workflows in a separate `aam-digital-shared-workflows` group, never pinned to a digest. |
-| [`renovate/node`](node.json) | Node.js repos: `rangeStrategy: bump`, npm `>=11.0.0` constraint, monthly lock file maintenance, and one `node` group for `.nvmrc`, Dockerfile `FROM node:` and `node-version` inputs in workflows. |
+| [`renovate/node`](node.json) | Node.js repos: `rangeStrategy: bump`, npm `^11.0.0` constraint (the npm major that comes with the Node.js major in `.nvmrc`; change both together), monthly lock file maintenance, and one `node` group for `.nvmrc`, Dockerfile `FROM node:` and `node-version` inputs in workflows. |
 | [`renovate/docker`](docker.json) | Repos that build Docker images: minor/patch base image updates in a `docker-base-image` group (the `node` image stays in the `node` group). |
 
 ## Usage
