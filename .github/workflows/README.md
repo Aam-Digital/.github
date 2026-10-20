@@ -5,11 +5,10 @@ Inputs, secrets and outputs are documented in the `workflow_call` section at the
 
 | Workflow | What it does | Typical trigger in the caller | Permissions of the calling job | Check name |
 | --- | --- | --- | --- | --- |
-| [`docker-image.yml`](docker-image.yml) | Builds and pushes a container image (PR, edge, release) | `pull_request`, `push`, `release: published` | `contents: read`, `packages: write` | `<job> / build`; with `native-runners`: `<job> / build-native (<platform>)`, `<job> / merge` |
+| [`docker-image.yml`](docker-image.yml) | Builds and pushes a container image (PR, edge, release), each platform on a native runner | `pull_request`, `push`, `release: published` | `contents: read`, `packages: write` | `<job> / build (<platform>)`, `<job> / merge` |
 | [`edge-version.yml`](edge-version.yml) | Computes the version of an edge build (`1.4.1-edge.5`) | `push` to the default branch | `contents: read` | `<job> / version` |
 | [`release.yml`](release.yml) | Creates the next full release with semantic-release | `push` to the default branch, or `workflow_dispatch` | `contents: read` (+ PAT as secret `token`) | `<job> / release` |
-| [`image-prune.yml`](image-prune.yml) | Deletes old edge images (`*-edge.*`) after a full release | `release: published` | `packages: write` | `<job> / prune` |
-| [`pr-image-cleanup.yml`](pr-image-cleanup.yml) | Deletes the `pr-<n>` image when a PR closes, then untagged images older than 2 days | `pull_request: closed` | `actions: write`, `packages: write` | `<job> / cleanup` |
+| [`image-cleanup.yml`](image-cleanup.yml) | Deletes the `pr-<n>` image when a PR closes, or the edge images (`tags: "*-edge.*"`) after a full release; then untagged images older than 2 days | `pull_request: closed`, `release: published` | `actions: write`, `packages: write` | `<job> / cleanup` |
 | [`pr-title-lint.yml`](pr-title-lint.yml) | Checks that PR titles follow Conventional Commits | `pull_request_target` | `pull-requests: read` | `<job> / Validate PR title` |
 | [`actionlint.yml`](actionlint.yml) | Lints the repository's workflows (with shellcheck) | `pull_request`, `push` | `contents: read` | `<job> / actionlint` |
 
@@ -38,8 +37,8 @@ jobs:
 - The caller's **secrets and `env` are not passed on**: pass secrets explicitly under `secrets:`, everything else as
   inputs.
 - **Check names** become `<caller job> / <called job>`. Moving an existing job into a shared workflow renames its
-  check, so update the required checks of the ruleset when that PR merges. Skipped jobs (e.g. `build-native` and
-  `merge` when `native-runners` is off) count as passed.
+  check, so update the required checks of the ruleset when that PR merges. Skipped jobs (e.g. `merge` when `push` is
+  false) count as passed.
 - `pr-title-lint.yml` only works with squash-only merging and the PR title as commit title. Call it on
   `pull_request_target` with the comment `# zizmor: ignore[dangerous-triggers]` on that line, otherwise `qlty check`
   fails.
@@ -61,7 +60,7 @@ Every push to the default branch builds an **edge** image; full releases come fr
 - **Full release**, in one of two modes: **auto** (`release.yml` on every push; a `fix`/`feat`/breaking change is
   released right away) or **manual** (`release.yml` via `workflow_dispatch`). Releases are created with a PAT, because
   releases created with the `GITHUB_TOKEN` trigger no workflows. The `release: published` event builds the image, and
-  `image-prune.yml` then deletes the edge images of the finished cycle.
+  `image-cleanup.yml` then deletes the edge images of the finished cycle.
 
 | Build | Image tags |
 | --- | --- |
