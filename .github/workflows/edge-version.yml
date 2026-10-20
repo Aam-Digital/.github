@@ -6,8 +6,7 @@
 # `version` = this version, tag `edge` only if `is-head`).
 #
 # Full releases are the tags `<tag-prefix><X.Y.Z>` or `<tag-prefix>v<X.Y.Z>` (prerelease tags such as
-# `1.4.0-master.3` are ignored). A leading `v` of the last release tag is kept, so that the edge tags look like the
-# repository's release tags (`v1.4.1-edge.5`).
+# `1.4.0-master.3` are ignored). The version is always plain (`1.4.1-edge.5`), also after a `v`-prefixed release tag.
 name: Edge version
 
 on:
@@ -25,7 +24,7 @@ on:
         description: Prerelease identifier of the version, as in `1.4.1-edge.5`
     outputs:
       version:
-        description: The edge version, e.g. `1.4.1-edge.5` (or `v1.4.1-edge.5` if the release tags start with `v`)
+        description: The edge version, e.g. `1.4.1-edge.5`
         value: ${{ jobs.version.outputs.version }}
       is-head:
         description: >-
@@ -80,10 +79,8 @@ jobs:
             base="0.0.0"
             count=$(git rev-list --count --first-parent HEAD)
           fi
-          v=""
-          [[ "$base" != v* ]] || v="v"
           IFS=. read -r major minor patch <<< "${base#v}"
-          version="$v$major.$minor.$((patch + 1))-$IDENTIFIER.$count"
+          version="$major.$minor.$((patch + 1))-$IDENTIFIER.$count"
 
           # Only the newest commit of the default branch may move the `edge` tag.
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/heads/$DEFAULT_BRANCH" --jq .sha)
