@@ -1,0 +1,192 @@
+# Deletes images from ghcr.io: the `pr-<number>` image when a PR is closed, or the edge images (`*-edge.*`) of the
+# finished cycle after a full release. Afterwards it deletes the package's untagged images older than 2 days.
+#
+# Uses dataaxiom/ghcr-cleanup-action, which is manifest-aware:
+# - deleting a multi-platform image index also deletes its per-platform and attestation manifests,
+#   unless another image still references them;
+# - a version that carries one of the `exclude-tags` (e.g. the image `edge` points to now) is neither deleted nor
+#   untagged;
+# - a version that carries another tag besides the deleted ones is only untagged, not deleted;
+# - it reads all package versions (paginated), not only the first page.
+#
+# Most leaked PR images are a race, not a failed delete: the build of the PR's last push is still running when
+# the PR is merged, so it pushes `pr-<n>` after the cleanup ran. With `build-workflows`, unfinished runs of the PR
+# build workflow(s) on the PR's head branch are cancelled, and the cleanup waits until they have stopped.
+name: Image cleanup
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          ghcr.io package name(s) owned by the repository owner, comma-separated
+          (e.g. `aam-services,keycloak-third-party-authentication`). Defaults to the repository name.
+      tags:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          Tags to delete, comma-separated; `*` matches any characters (e.g. `*-edge.*` after a release).
+          Defaults to `pr-<number>` of the pull request that triggered the workflow.
+      exclude-tags:
+        type: string
+        required: false
+        default: edge,main,master,stable,latest
+        description: Comma-separated tags (wildcards allowed) whose images are never deleted or untagged
+      build-workflows:
+        type: string
+        required: false
+        default: ""
+        description: >-
+          Workflow file name(s) of the PR image build, comma-separated (e.g. `pr-release.yml`). Their unfinished runs
+          on the PR's head branch are cancelled, and awaited, before deleting, so that they cannot push the image again
+          afterwards. Only used when triggered by a pull request.
+      untagged-older-than:
+        type: string
+        required: false
+        default: 2 days
+        description: >-
+          Afterwards, also delete the untagged images of the package(s) older than this (e.g. images replaced by later
+          pushes). Format as in ghcr-cleanup-action's `older-than` (e.g. `2 days`). Empty: keep untagged images.
+      dry-run:
+        type: boolean
+        required: false
+        default: false
+        description: Only log what would be deleted
+    secrets:
+      token:
+        required: false
+        description: >-
+          Token for the GitHub Packages API (classic PAT with `read:packages` and `delete:packages`).
+          Defaults to the workflow's GITHUB_TOKEN, which can delete versions of packages that are linked to the
+          repository (with the Admin role in the package's "Manage Actions access" settings).
+
+jobs:
+  # The job id is part of the check name (`<caller job> / cleanup`). Do not rename it within v1.
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # cancel unfinished PR builds (build-workflows)
+      packages: write # delete package versions
+    # Serialize runs for the same tags only. A group per package would cancel cleanups: GitHub keeps just one pending
+    # run per group, and a run can wait here for PR builds for minutes. Parallel runs for different tags are safe
+    # enough: a manifest shared with another image is never deleted (at worst it is left behind).
+    concurrency:
+      group: ghcr-cleanup-${{ github.repository }}-${{ inputs.tags || github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Check inputs
+        id: config
+        env:
+          PACKAGES: ${{ inputs.packages || github.event.repository.name }}
+          TAGS: ${{ inputs.tags }}
+          EXCLUDE_TAGS: ${{ inputs.exclude-tags }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          PACKAGES="${PACKAGES//[[:space:]]/}"
+          TAGS="${TAGS//[[:space:]]/}"
+          EXCLUDE_TAGS="${EXCLUDE_TAGS//[[:space:]]/}"
+          if [ -z "$TAGS" ]; then
+            if [ -z "$PR_NUMBER" ]; then
+              echo "::error::No 'tags' given and not triggered by a pull_request event"
+              exit 1
+            fi
+            TAGS="pr-$PR_NUMBER"
+          fi
+          if ! [[ "$PACKAGES" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
+            echo "::error::Invalid package list '$PACKAGES'"
+            exit 1
+          fi
+          # Without tags, ghcr-cleanup-action would fall back to deleting all untagged versions.
+          if ! [[ "$TAGS" =~ ^[A-Za-z0-9_.*-]+(,[A-Za-z0-9_.*-]+)*$ ]]; then
+            echo "::error::Invalid tag list '$TAGS'"
+            exit 1
+          fi
+          # Every tag pattern must name something (a bare `*` would delete every image without an excluded tag).
+          IFS=',' read -r -a patterns <<< "$TAGS"
+          for pattern in "${patterns[@]}"; do
+            if ! [[ "$pattern" =~ [A-Za-z0-9] ]]; then
+              echo "::error::Tag pattern '$pattern' is too broad"
+              exit 1
+            fi
+          done
+          if [ -n "$EXCLUDE_TAGS" ] && ! [[ "$EXCLUDE_TAGS" =~ ^[A-Za-z0-9_.*-]+(,[A-Za-z0-9_.*-]+)*$ ]]; then
+            echo "::error::Invalid exclude-tags list '$EXCLUDE_TAGS'"
+            exit 1
+          fi
+          echo "Deleting tag(s) $TAGS (except images tagged $EXCLUDE_TAGS) from package(s) $PACKAGES"
+          {
+            echo "packages=$PACKAGES"
+            echo "tags=$TAGS"
+            echo "exclude-tags=$EXCLUDE_TAGS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cancel and wait for unfinished PR builds
+        if: inputs.build-workflows != '' && github.event.pull_request.head.repo.full_name == github.repository
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_WORKFLOWS: ${{ inputs.build-workflows }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          OWN_RUN_ID: ${{ github.run_id }}
+        run: |
+          IFS=',' read -r -a workflows <<< "${BUILD_WORKFLOWS//[[:space:]]/}"
+          run_ids=()
+          for workflow in "${workflows[@]}"; do
+            [ -n "$workflow" ] || continue
+            if ! [[ "$workflow" =~ ^[A-Za-z0-9_.-]+\.ya?ml$ ]]; then
+              echo "::error::Invalid workflow file name '$workflow'"
+              exit 1
+            fi
+            mapfile -t -O "${#run_ids[@]}" run_ids < <(gh run list -R "$GITHUB_REPOSITORY" --workflow "$workflow" \
+              --branch "$HEAD_REF" --limit 50 --json databaseId,status \
+              --jq ".[] | select(.status != \"completed\" and .databaseId != $OWN_RUN_ID) | .databaseId")
+          done
+          if [ "${#run_ids[@]}" -eq 0 ]; then
+            echo "No unfinished PR build runs"
+            exit 0
+          fi
+          for id in "${run_ids[@]}"; do
+            echo "Cancelling PR build run $id"
+            gh run cancel "$id" -R "$GITHUB_REPOSITORY" || true # it may have finished in the meantime
+          done
+          for id in "${run_ids[@]}"; do
+            until [ "$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json status --jq .status)" = "completed" ]; do
+              echo "Waiting for run $id to stop ..."
+              sleep 10
+            done
+          done
+
+      - name: Delete images
+        # also after a timeout of the step above (deleting what is there is better than nothing),
+        # but never without validated packages and tags
+        if: ${{ !cancelled() && steps.config.outcome == 'success' }}
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.token || github.token }}
+          owner: ${{ github.repository_owner }}
+          packages: ${{ steps.config.outputs.packages }}
+          delete-tags: ${{ steps.config.outputs.tags }}
+          exclude-tags: ${{ steps.config.outputs.exclude-tags }}
+          delete-untagged: false
+          dry-run: ${{ inputs.dry-run }}
+
+      # Images whose last tag moved to a newer push (earlier pushes to PRs, a moving tag such as `edge` or `main`)
+      # stay in the package untagged until here. Children of tagged images are never deleted. Only images older than
+      # `untagged-older-than` are touched, so that builds in progress keep their per-platform images. A separate step,
+      # because `older-than` applies to everything the action deletes. Best effort: two cleanups running at the same
+      # time may race for the same version.
+      - name: Delete untagged images
+        if: ${{ !cancelled() && steps.config.outcome == 'success' && inputs.untagged-older-than != '' }}
+        continue-on-error: true
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.token || github.token }}
+          owner: ${{ github.repository_owner }}
+          packages: ${{ steps.config.outputs.packages }}
+          delete-untagged: true
+          older-than: ${{ inputs.untagged-older-than }}
+          dry-run: ${{ inputs.dry-run }}

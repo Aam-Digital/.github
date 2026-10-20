@@ -1,0 +1,106 @@
+# Creates the next full release of the calling repository with semantic-release, from its default branch.
+# Edge builds (every push to the default branch) need no release: see edge-version.yml.
+#
+# Only the `branches` setting is overridden here (the caller's default branch); the plugins and everything else stay
+# in the repository's own semantic-release configuration (`.releaserc*`, `release.config.*` or package.json).
+#
+# The release is created with the `token` PAT: releases created with the GITHUB_TOKEN would not trigger the
+# `release: published` workflow that builds the image.
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      extra-plugins:
+        type: string
+        required: false
+        default: ""
+        description: semantic-release plugins to install that the configuration uses (one per line, optionally `@version`)
+      node-version-file:
+        type: string
+        required: false
+        default: .nvmrc
+        description: >-
+          File with the Node.js version to run semantic-release with. If it does not exist, the latest LTS is used.
+          If package.json has `"packageManager": "npm@x.y.z"`, that npm is installed.
+    secrets:
+      token:
+        required: true
+        description: >-
+          PAT that may push tags and create releases (and comment on issues/PRs, if the configuration does that).
+          Not the GITHUB_TOKEN: its releases trigger no workflows.
+      slack-webhook:
+        required: false
+        description: Slack webhook URL, available to the plugins as the environment variable `SLACK_WEBHOOK`
+    outputs:
+      version:
+        description: The version that was released (empty if none)
+        value: ${{ jobs.release.outputs.version }}
+      published:
+        description: "`true` if a release was created, `false` if there was nothing to release (empty if the job was skipped because the ref is not the default branch)"
+        value: ${{ jobs.release.outputs.published }}
+
+jobs:
+  # The job id is part of the check name (`<caller job> / release`). Do not rename it within v1.
+  release:
+    # Only the default branch is released. Skipping the job on any other ref (instead of a no-op run inside it)
+    # also keeps it out of the concurrency group below: GitHub keeps just one *pending* run per group, so a no-op run
+    # of a push to another branch would otherwise replace a release that is waiting for the default branch.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # everything that writes uses the `token` secret
+    # Releases of one repository must not run in parallel (they would compute the same version).
+    concurrency:
+      group: semantic-release-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.semantic.outputs.new_release_published == 'true' && steps.semantic.outputs.new_release_version || '' }}
+      published: ${{ steps.semantic.outputs.new_release_published || 'false' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # semantic-release pushes with the `token` (passed as GITHUB_TOKEN below), not the job's token
+          persist-credentials: false
+
+      - name: Node.js version and branches
+        id: node
+        env:
+          NODE_VERSION_FILE: ${{ inputs.node-version-file }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ -f "$NODE_VERSION_FILE" ]; then
+            echo "file=$NODE_VERSION_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "No $NODE_VERSION_FILE, using the latest Node.js LTS"
+            echo "file=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branches=$(jq -cn --arg name "$DEFAULT_BRANCH" '[{name: $name}]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ${{ steps.node.outputs.file }}
+          node-version: ${{ steps.node.outputs.file == '' && 'lts/*' || '' }}
+
+      - name: Set up npm from packageManager
+        if: hashFiles('package.json') != ''
+        run: |
+          package_manager=$(jq -r '.packageManager // ""' package.json)
+          if [[ "$package_manager" =~ ^npm@([0-9]+\.[0-9]+\.[0-9]+[^+]*) ]]; then
+            echo "Installing npm ${BASH_REMATCH[1]} (packageManager in package.json)"
+            npm install --global "npm@${BASH_REMATCH[1]}"
+          fi
+          npm --version
+
+      - name: Semantic Release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@03595b5eaf44910cf239ff20904cc52d410f97d4 # v8.1.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.token }}
+          SLACK_WEBHOOK: ${{ secrets.slack-webhook }}
+        with:
+          branches: ${{ steps.node.outputs.branches }}
+          extra_plugins: ${{ inputs.extra-plugins }}

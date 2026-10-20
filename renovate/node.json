@@ -1,0 +1,17 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Add-on for Node.js repos (use together with renovate/default). Repos that set enabledManagers must include \"nvm\" for the .nvmrc part.",
+  "extends": [":maintainLockFilesMonthly"],
+  "rangeStrategy": "bump",
+  "constraints": {
+    "npm": ">=11.0.0"
+  },
+  "packageRules": [
+    {
+      "description": "The Node.js version in .nvmrc (read by CI via setup-node's node-version-file) and the node base image in Dockerfiles move together. Also catches node-version inputs still hard-coded in workflows.",
+      "matchManagers": ["nvm", "dockerfile", "github-actions"],
+      "matchDepNames": ["node"],
+      "groupName": "node"
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+# Computes the version of an edge build: the newest build of the default branch, made on every push to it.
+#
+# The version is the last full release with the patch number bumped, plus the number of commits since that release:
+# 5 commits after `1.4.0` give `1.4.1-edge.5`. It sorts above the last release and below any later one, and it needs
+# no semantic-release run, no git tag and no GitHub release. Callers build the image with it (`docker-image.yml`,
+# `version` = this version, tag `edge` only if `is-head`).
+#
+# Full releases are the tags `<tag-prefix><X.Y.Z>` or `<tag-prefix>v<X.Y.Z>` (prerelease tags such as
+# `1.4.0-master.3` are ignored). The version is always plain (`1.4.1-edge.5`), also after a `v`-prefixed release tag.
+name: Edge version
+
+on:
+  workflow_call:
+    inputs:
+      tag-prefix:
+        type: string
+        required: false
+        default: ""
+        description: Prefix of the release tags before the version, e.g. `aam-backend-service/` in a monorepo
+      identifier:
+        type: string
+        required: false
+        default: edge
+        description: Prerelease identifier of the version, as in `1.4.1-edge.5`
+    outputs:
+      version:
+        description: The edge version, e.g. `1.4.1-edge.5`
+        value: ${{ jobs.version.outputs.version }}
+      is-head:
+        description: >-
+          `true` if this commit is still the head of the default branch. Only then should the build move the `edge`
+          tag: an older run that finishes late must not move it back.
+        value: ${{ jobs.version.outputs.is-head }}
+
+jobs:
+  # The job id is part of the check name (`<caller job> / version`). Do not rename it within v1.
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is-head: ${{ steps.version.outputs.is-head }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # all commits and tags since the last release
+          filter: tree:0 # commits only, no file contents: enough for describe and rev-list
+          persist-credentials: false
+
+      - name: Compute edge version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          IDENTIFIER: ${{ inputs.identifier }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ! [[ "$IDENTIFIER" =~ ^[0-9A-Za-z-]+$ ]]; then
+            echo "::error::Invalid identifier '$IDENTIFIER'"
+            exit 1
+          fi
+
+          # nearest full release in this commit's history: `<prefix>X.Y.Z` or `<prefix>vX.Y.Z`, no prerelease tags
+          last=$(git describe --tags --abbrev=0 \
+            --match "${TAG_PREFIX}[0-9]*" --match "${TAG_PREFIX}v[0-9]*" \
+            --exclude "${TAG_PREFIX}*-*" 2>/dev/null || true)
+          if [ -n "$last" ] && ! [[ "${last#"$TAG_PREFIX"}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The last release tag '$last' is not '${TAG_PREFIX}X.Y.Z'"
+            exit 1
+          fi
+
+          if [ -n "$last" ]; then
+            base="${last#"$TAG_PREFIX"}"
+            count=$(git rev-list --count --first-parent "$last..HEAD")
+          else
+            echo "::notice::No release tag '${TAG_PREFIX}X.Y.Z' found, counting from 0.0.0"
+            base="0.0.0"
+            count=$(git rev-list --count --first-parent HEAD)
+          fi
+          IFS=. read -r major minor patch <<< "${base#v}"
+          version="$major.$minor.$((patch + 1))-$IDENTIFIER.$count"
+
+          # Only the newest commit of the default branch may move the `edge` tag.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/heads/$DEFAULT_BRANCH" --jq .sha)
+          is_head=false
+          [ "$head" != "$GITHUB_SHA" ] || is_head=true
+
+          echo "Last release: ${last:-none}, commits since: $count, edge version: $version (head of $DEFAULT_BRANCH: $is_head)"
+          {
+            echo "version=$version"
+            echo "is-head=$is_head"
+          } >> "$GITHUB_OUTPUT"
