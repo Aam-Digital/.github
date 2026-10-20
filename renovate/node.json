@@ -1,10 +1,10 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Add-on for Node.js repos (use together with renovate/default). Repos that set enabledManagers must include \"nvm\" for the .nvmrc part.",
+  "description": "Add-on for Node.js repos (use together with renovate/default). Repos that set enabledManagers must include \"nvm\" for the .nvmrc part. The npm constraint is the npm major that comes with the Node.js major in .nvmrc (Node 24: npm 11), so that Renovate writes lock files with the same npm as CI and developers; change it together with the Node.js major.",
   "extends": [":maintainLockFilesMonthly"],
   "rangeStrategy": "bump",
   "constraints": {
-    "npm": ">=11.0.0"
+    "npm": "^11.0.0"
   },
   "packageRules": [
     {
