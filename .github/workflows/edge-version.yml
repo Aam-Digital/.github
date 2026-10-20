@@ -2,7 +2,7 @@
 #
 # The version is the last full release with the patch number bumped, plus the number of commits since that release:
 # 5 commits after `1.4.0` give `1.4.1-edge.5`. It sorts above the last release and below any later one, and it needs
-# no semantic-release run, no tag and no GitHub release. Callers build the image with it (`docker-image.yml`,
+# no semantic-release run, no git tag and no GitHub release. Callers build the image with it (`docker-image.yml`,
 # `version` = this version, tag `edge` only if `is-head`).
 #
 # Full releases are the tags `<tag-prefix><X.Y.Z>` or `<tag-prefix>v<X.Y.Z>` (prerelease tags such as

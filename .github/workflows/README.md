@@ -55,8 +55,9 @@ Every push to the default branch builds an **edge** image; full releases come fr
 [semantic-release](https://semantic-release.gitbook.io/) (plugins in each repository's own `.releaserc*`).
 
 - **Edge build:** `edge-version.yml` computes `<last release, patch + 1>-edge.<commits since>`, e.g. `1.4.1-edge.5`.
-  There is no tag and no GitHub release for it. Move the `edge` tag only if `is-head` is `true`, and give the image job
-  a `concurrency` group with `cancel-in-progress: true`, so that an older run never moves `edge` back.
+  The image is tagged with it, but there is no git tag and no GitHub release. Move the `edge` image tag only if
+  `is-head` is `true`, and give the image job a `concurrency` group with `cancel-in-progress: true`, so that an older
+  run never moves `edge` back.
 - **Full release**, in one of two modes: **auto** (`release.yml` on every push; a `fix`/`feat`/breaking change is
   released right away) or **manual** (`release.yml` via `workflow_dispatch`). Releases are created with a PAT, because
   releases created with the `GITHUB_TOKEN` trigger no workflows. The `release: published` event builds the image, and
