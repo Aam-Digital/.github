@@ -2,21 +2,21 @@
 # Callers only pass inputs; see README.md in this folder for examples and the resulting check names.
 #
 # Tags are always explicit (docker/metadata-action's automatic `latest` is turned off):
-# - `version`      -> tag `<version>` (+ the `org.opencontainers.image.version` label)
+# - `version`      -> tag `<version>`
 # - `stable: true` -> tags `stable` and `latest` (derive it from `!github.event.release.prerelease`,
 #                     never by parsing the version string)
 # - `tags`         -> any extra tags, e.g. `edge`, `master` or `pr-123`
-# A PR image must carry nothing but its `pr-<n>` tag, otherwise pr-image-cleanup.yml leaves it in place.
+# docker/metadata-action sets the first of these tags (the version, if given) as the `org.opencontainers.image.version`
+# label. A PR image must carry nothing but its `pr-<n>` tag, otherwise image-cleanup.yml leaves it in place.
 #
-# Two modes:
-# - default: one job `build` builds all platforms (QEMU for non-amd64 platforms);
-# - `native-runners: true`: one job `build-native (<platform>)` per platform on a native runner pushes by digest,
-#   then the job `merge` creates the multi-platform image with all tags.
+# Every platform is built on a native runner (`linux/amd64` on `ubuntu-latest`, `linux/arm64` on `ubuntu-24.04-arm`),
+# never emulated with QEMU: the job `build (<platform>)` pushes its image by digest only, then the job `merge` creates
+# the multi-platform image with all tags.
 #
 # An image whose last tag moves to a new push (e.g. the previous image of a PR) stays in the package untagged.
-# pr-image-cleanup.yml deletes such untagged images (older than 2 days) when a PR is closed.
+# image-cleanup.yml deletes such untagged images (older than 2 days).
 #
-# Steps that are identical in several jobs are written once and reused with YAML anchors (`&name` / `*name`).
+# Steps that are identical in both jobs are written once and reused with YAML anchors (`&name` / `*name`).
 name: Docker image
 
 on:
@@ -40,7 +40,7 @@ on:
         type: string
         required: false
         default: ""
-        description: Version to tag the image with; also set as the `org.opencontainers.image.version` label. Leave empty for PR builds.
+        description: Version to tag the image with; also the `org.opencontainers.image.version` label. Leave empty for PR builds.
       stable:
         type: boolean
         required: false
@@ -61,16 +61,8 @@ on:
         required: false
         default: linux/amd64,linux/arm64
         description: >-
-          Target platforms. PR builds pass `linux/amd64`. QEMU is only set up if a non-amd64 platform is requested.
-          With `native-runners`, only `linux/amd64` and `linux/arm64` are supported.
-      native-runners:
-        type: boolean
-        required: false
-        default: false
-        description: >-
-          Build each platform on a native runner (`linux/amd64` on `ubuntu-latest`, `linux/arm64` on
-          `ubuntu-24.04-arm`) instead of emulating with QEMU, then merge them into one multi-platform image.
-          Check names change to `<caller job> / build-native (<platform>)` and `<caller job> / merge`.
+          Target platforms: `linux/amd64` and/or `linux/arm64`, each built on a native runner. PR builds pass
+          `linux/amd64`.
       build-args:
         type: string
         required: false
@@ -87,8 +79,8 @@ on:
         default: ""
         description: >-
           GitHub Actions cache scope. Defaults to the last path segment of the first image, so that the images of a
-          multi-image repository do not overwrite each other's cache. Must differ between calls in the same workflow run
-          with `native-runners` (it also names the digest artifacts).
+          multi-image repository do not overwrite each other's cache. Must differ between calls in the same workflow
+          run (it also names the digest artifacts).
       artifact-name:
         type: string
         required: false
@@ -109,7 +101,7 @@ on:
     secrets:
       DOCKERHUB_USERNAME:
         required: false
-        description: Docker Hub username; only needed if one of the images is pushed to Docker Hub
+        description: Docker Hub username; if set, the build logs in to Docker Hub (needed if one of the images is pushed there)
       DOCKERHUB_TOKEN:
         required: false
         description: Docker Hub access token (or password) for DOCKERHUB_USERNAME
@@ -117,56 +109,48 @@ on:
         required: false
         description: >-
           Secrets for the build as BuildKit secrets (`id=value`, one per line; the format of build-push-action's
-          `secrets` input), e.g. `sentry_auth_token=<token>`. Read in the Dockerfile with
-          `RUN --mount=type=secret,id=sentry_auth_token ...`. Masked in the logs; unset or empty passes no secret.
+          `secrets` input), e.g. `format('sentry_auth_token={0}', secrets.SENTRY_TOKEN)`. Read in the Dockerfile with
+          `RUN --mount=type=secret,id=sentry_auth_token ...`. Unset or empty passes no secret.
     outputs:
       digest:
-        description: Digest of the built image (the multi-platform index if more than one platform was built)
-        value: ${{ jobs.build.outputs.digest || jobs.merge.outputs.digest }}
+        description: Digest of the multi-platform image (empty if `push` is false)
+        value: ${{ jobs.merge.outputs.digest }}
       tags:
-        description: All image references that were tagged (`<image>:<tag>`, one per line)
-        value: ${{ jobs.build.outputs.tags || jobs.merge.outputs.tags }}
+        description: All image references that were tagged (`<image>:<tag>`, one per line; empty if `push` is false)
+        value: ${{ jobs.merge.outputs.tags }}
 
 jobs:
-  # The job id is part of the check name (`<caller job> / build`). Do not rename it within v1.
+  # Part 1: one job per platform (check name `<caller job> / build (<platform>)`), each pushes its image by digest
+  # only. Do not rename within v1.
   build:
-    if: ${{ !inputs.native-runners }}
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Expressions cannot split strings, so the two supported platforms are picked by `contains`.
+        # Any other platform is rejected by the step "Compute tags and settings".
+        platform: ${{ fromJSON(contains(inputs.platforms, 'linux/arm64') && (contains(inputs.platforms, 'linux/amd64') && '["linux/amd64","linux/arm64"]' || '["linux/arm64"]') || '["linux/amd64"]') }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write # push to ghcr.io
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-      tags: ${{ steps.meta.outputs.tags }}
+    env:
+      # Secrets cannot be used in a step's `if`; this decides whether to log in to Docker Hub.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      PLATFORM_PAIR: ${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
     steps:
-      - &mask-build-secrets
-        name: Mask build secrets
-        env:
-          BUILD_SECRETS: ${{ secrets.BUILD_SECRETS }}
-        run: |
-          # Every value is masked in the logs, also if the caller composed BUILD_SECRETS (`format(...)`) from
-          # a secret and GitHub does not know the composed value as a secret. Nothing is printed.
-          while IFS= read -r line; do
-            value="${line#*=}"
-            [ -z "$value" ] || echo "::add-mask::$value"
-          done <<< "$BUILD_SECRETS"
-
-      - &checkout
-        name: Checkout repository
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - &download-artifact
-        name: Download artifact ${{ inputs.artifact-name }}
+      - name: Download artifact ${{ inputs.artifact-name }}
         if: inputs.artifact-name != ''
         uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.artifact-name }}
           path: ${{ inputs.artifact-path }}
 
-      - &prepare
-        name: Prepare build
+      - name: Prepare build
         if: inputs.prepare != ''
         env:
           PREPARE: ${{ inputs.prepare }}
@@ -181,9 +165,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           STABLE: ${{ inputs.stable }}
           EXTRA_TAGS: ${{ inputs.tags }}
-          LABELS: ${{ inputs.labels }}
           PLATFORMS: ${{ inputs.platforms }}
-          NATIVE_RUNNERS: ${{ inputs.native-runners }}
           CACHE_SCOPE: ${{ inputs.cache-scope }}
         run: |
           # Splits a list separated by newlines, commas or spaces into words.
@@ -216,32 +198,12 @@ jobs:
             fi
           done
 
-          labels="$LABELS"
-          if [ -n "$VERSION" ] && ! grep -q '^[[:space:]]*org\.opencontainers\.image\.version=' <<< "$LABELS"; then
-            labels="org.opencontainers.image.version=$VERSION"$'\n'"$LABELS"
-          fi
-
-          needs_qemu=false
           while IFS= read -r platform; do
-            [ "$platform" = "linux/amd64" ] || needs_qemu=true
-            if [ "$NATIVE_RUNNERS" = "true" ] && [ "$platform" != "linux/amd64" ] && [ "$platform" != "linux/arm64" ]; then
-              echo "::error::'native-runners' supports only the platforms linux/amd64 and linux/arm64, not '$platform'"
+            if [ "$platform" != "linux/amd64" ] && [ "$platform" != "linux/arm64" ]; then
+              echo "::error::Only the platforms linux/amd64 and linux/arm64 are supported, not '$platform'"
               exit 1
             fi
           done < <(words "$PLATFORMS")
-          [ "$NATIVE_RUNNERS" != "true" ] || needs_qemu=false
-
-          needs_ghcr_login=false
-          needs_dockerhub_login=false
-          for image in "${images[@]}"; do
-            host="${image%%/*}"
-            case "$host" in
-              ghcr.io) needs_ghcr_login=true ;;
-              docker.io | index.docker.io) needs_dockerhub_login=true ;;
-              *.* | *:* | localhost) ;; # another registry: not supported for login
-              *) needs_dockerhub_login=true ;; # no registry host means Docker Hub
-            esac
-          done
 
           scope="$CACHE_SCOPE"
           if [ -z "$scope" ]; then
@@ -260,18 +222,12 @@ jobs:
             echo "tag-list<<$delimiter"
             printf '%s\n' "${tags[@]}"
             echo "$delimiter"
-            echo "labels<<$delimiter"
-            printf '%s\n' "$labels"
-            echo "$delimiter"
-            echo "needs-qemu=$needs_qemu"
-            echo "needs-ghcr-login=$needs_ghcr_login"
-            echo "needs-dockerhub-login=$needs_dockerhub_login"
             echo "cache-scope=$scope"
           } >> "$GITHUB_OUTPUT"
 
           echo "Images: ${images[*]}"
           echo "Tags: ${tags[*]}"
-          echo "Platforms: $PLATFORMS (native runners: $NATIVE_RUNNERS, QEMU: $needs_qemu)"
+          echo "Platforms: $PLATFORMS"
           echo "Cache scope: $scope"
 
       - &meta
@@ -281,21 +237,18 @@ jobs:
         with:
           images: ${{ steps.config.outputs.images }}
           tags: ${{ steps.config.outputs.tags }}
-          labels: ${{ steps.config.outputs.labels }}
+          labels: ${{ inputs.labels }}
           flavor: |
             latest=false
-
-      - name: Set up QEMU
-        if: steps.config.outputs.needs-qemu == 'true'
-        uses: docker/setup-qemu-action@v4
 
       - &setup-buildx
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # Logging in to a registry none of the images is pushed to does no harm.
       - &login-ghcr
         name: Login to GitHub Container Registry
-        if: inputs.push && steps.config.outputs.needs-ghcr-login == 'true'
+        if: inputs.push
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -304,54 +257,11 @@ jobs:
 
       - &login-dockerhub
         name: Login to Docker Hub
-        if: inputs.push && steps.config.outputs.needs-dockerhub-login == 'true'
+        if: inputs.push && env.DOCKERHUB_USERNAME != ''
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push image
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.file }}
-          platforms: ${{ inputs.platforms }}
-          build-args: ${{ inputs.build-args }}
-          push: ${{ inputs.push }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          secrets: ${{ secrets.BUILD_SECRETS }}
-          cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}
-          cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }},ignore-error=true
-
-  # Native-runner mode, part 1: one job per platform (check name `<caller job> / build-native (<platform>)`), each
-  # pushes its image by digest only. Do not rename within v1.
-  build-native:
-    if: inputs.native-runners
-    # No `name` with a matrix expression: GitHub appends the matrix value itself (`build-native (linux/amd64)`),
-    # while the jobs skipped without native-runners would show the unexpanded expression.
-    name: build-native
-    strategy:
-      fail-fast: false
-      matrix:
-        # Expressions cannot split strings, so the two supported platforms are picked by `contains`.
-        # Any other platform is rejected by the step "Compute tags and settings".
-        platform: ${{ fromJSON(contains(inputs.platforms, 'linux/arm64') && (contains(inputs.platforms, 'linux/amd64') && '["linux/amd64","linux/arm64"]' || '["linux/arm64"]') || '["linux/amd64"]') }}
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    permissions:
-      contents: read
-      packages: write # push to ghcr.io
-    steps:
-      - *mask-build-secrets
-      - *checkout
-      - *download-artifact
-      - *prepare
-      - *config
-      - *meta
-      - *setup-buildx
-      - *login-ghcr
-      - *login-dockerhub
 
       - name: Build and push image by digest
         id: build
@@ -364,8 +274,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           secrets: ${{ secrets.BUILD_SECRETS }}
           outputs: ${{ inputs.push && format('type=image,"name={0}",push-by-digest=true,name-canonical=true,push=true', steps.config.outputs.image-names) || 'type=cacheonly' }}
-          cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
-          cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }}-${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }},ignore-error=true
+          cache-from: type=gha,scope=${{ steps.config.outputs.cache-scope }}-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=min,scope=${{ steps.config.outputs.cache-scope }}-${{ env.PLATFORM_PAIR }},ignore-error=true
 
       - name: Export digest
         if: inputs.push
@@ -383,21 +293,23 @@ jobs:
         if: inputs.push
         uses: actions/upload-artifact@v7
         with:
-          name: docker-image-digests-${{ steps.config.outputs.cache-scope }}--${{ matrix.platform == 'linux/arm64' && 'arm64' || 'amd64' }}
+          name: docker-image-digests-${{ steps.config.outputs.cache-scope }}--${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
           overwrite: true
 
-  # Native-runner mode, part 2: creates the multi-platform image with all tags (check name `<caller job> / merge`).
-  # Do not rename within v1.
+  # Part 2: creates the multi-platform image with all tags (check name `<caller job> / merge`; skipped if `push` is
+  # false). Do not rename within v1.
   merge:
-    if: inputs.native-runners && inputs.push
-    needs: build-native
+    if: inputs.push
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write # push to ghcr.io
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
@@ -416,6 +328,8 @@ jobs:
       - *login-ghcr
       - *login-dockerhub
 
+      # One `imagetools create` per image, from that image's own per-platform pushes, so that images in different
+      # registries (e.g. Docker Hub and ghcr.io) never need a cross-registry copy.
       - name: Create multi-platform image
         id: build
         env:
@@ -448,4 +362,3 @@ jobs:
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
