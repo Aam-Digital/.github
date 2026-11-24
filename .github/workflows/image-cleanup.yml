@@ -164,7 +164,7 @@ jobs:
         # also after a timeout of the step above (deleting what is there is better than nothing),
         # but never without validated packages and tags
         if: ${{ !cancelled() && steps.config.outcome == 'success' }}
-        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        uses: dataaxiom/ghcr-cleanup-action@ac45a8c04b1eb4b27974ca79a0a74f344c93664b # v1.3.0
         with:
           token: ${{ secrets.token || github.token }}
           owner: ${{ github.repository_owner }}
@@ -182,7 +182,7 @@ jobs:
       - name: Delete untagged images
         if: ${{ !cancelled() && steps.config.outcome == 'success' && inputs.untagged-older-than != '' }}
         continue-on-error: true
-        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        uses: dataaxiom/ghcr-cleanup-action@ac45a8c04b1eb4b27974ca79a0a74f344c93664b # v1.3.0
         with:
           token: ${{ secrets.token || github.token }}
           owner: ${{ github.repository_owner }}
